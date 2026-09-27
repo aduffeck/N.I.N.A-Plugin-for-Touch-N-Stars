@@ -1,6 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
+    <!-- The plugin itself targets net10.0 (and is built on Linux for PINS); a net8.0-windows test
+         project cannot reference it there, so the tests follow the plugin's framework on Linux. -->
+    <TargetFramework Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))">net10.0</TargetFramework>
     <AssemblyName>TouchNStars.Tests</AssemblyName>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
