@@ -44,6 +44,25 @@ internal static class GuideCameraDriverCatalog
         {
             if (driver != null && !string.IsNullOrWhiteSpace(driver.Name)) drivers[driver.Name] = driver;
         }
+        // These backend IDs are shared with pins-guider's NativeCameraCatalog. Devices are discovered separately
+        // by GetAvailableGuideCameras; listing SDK backends neither loads a library nor opens a camera.
+        foreach (var (name, label) in NativeBackends)
+            drivers[name] = new INDIDriver { Name = name, Label = label, Type = "camera" };
         return drivers.Values.OrderBy(driver => driver.Label ?? driver.Name, StringComparer.OrdinalIgnoreCase).ToList();
     }
+
+    private static readonly (string Name, string Label)[] NativeBackends =
+    [
+        ("sdk:asi", "ZWO ASI (Native SDK)"),
+        ("sdk:qhy", "QHY (Native SDK)"),
+        ("sdk:playerone", "Player One (Native SDK)"),
+        ("sdk:svbony", "SVBony (Native SDK)"),
+        ("sdk:svbony-legacy", "SVBony (Legacy Native SDK)"),
+        ("sdk:touptek", "ToupTek (Native SDK)"),
+        ("sdk:altair", "Altair (Native SDK)"),
+        ("sdk:ogma", "Ogma (Native SDK)"),
+        ("sdk:omegon", "Omegon (Native SDK)"),
+        ("sdk:risingcam", "Risingcam (Native SDK)"),
+        ("sdk:mallincam", "MallinCam (Native SDK)")
+    ];
 }

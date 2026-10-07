@@ -45,6 +45,14 @@ that has not returned by then answers 202 with `pending: true`, keeps running, a
 
 ## Status, data and settings
 
+Native SDK guide-camera backends use `GuideCameraDriver = sdk:<vendor>` (ASI, QHY, Player One,
+SVBony/current or legacy, ToupTek, Altair, Ogma, Omegon, Risingcam, MallinCam). `/cameras` discovers
+devices for the selected backend and includes the persistent PINS device ID in each SDK selection.
+SDK capture uses a separate connection and private camera settings, full raw frames with hardware
+binning, and mount pulse guiding. Camera ST4 remains an INDI option. Disconnect an INDI connection
+to the same physical camera before opening it through an SDK. The matching pins-guider SDK-support
+plugin must be deployed with this backend and the frontend.
+
 | Method | Route | Parameters | Response |
 |---|---|---|---|
 | GET | `/status` | | `{ available, connected, deviceId, deviceName, isNative, reason, status, contractVersion }`, always 200 so it can be polled. `status` is the `AdvancedGuiderStatus` (with the live coaching `hints` and `coachRunning`, and `decDrift: { direction, driftArcsecPerMin, safetyValveOpen }` in Dec guide mode Drift, else `null`), `null` unless a native guider is connected. |
@@ -54,7 +62,7 @@ that has not returned by then answers 202 with `pending: true`, keeps running, a
 | GET | `/settings` | | `{ connected, settings: AdvancedGuiderSetting[] }`. Works before the first connect, so the guide camera can be set up first. |
 | POST | `/settings` | `{ name, value }` | The updated `AdvancedGuiderSetting`. `value` may be a string, number or boolean; it is passed on as an invariant-culture string. |
 | GET | `/cameras` | | Guide camera device names for the configured driver. Works before the first connect. |
-| GET | `/camera-drivers` | | Camera driver entries (`name`, `label`, `type`) from the INDI registry and installed `/usr/share/indi/*.xml` CCD manifests. Third-party registry entries override installed labels. Works before selecting or connecting a guider; refresh to discover registry changes. |
+| GET | `/camera-drivers` | | Camera backend entries (`name`, `label`, `type`) from the INDI registry, installed `/usr/share/indi/*.xml` CCD manifests, and supported native SDKs (`sdk:<vendor>`). Third-party registry entries override installed INDI labels. Works before selecting or connecting a guider; refresh to discover registry changes. SDK entries describe backends, not attached devices. |
 | GET | `/image` | `maxWidth` (1024), `stretch` (0.2), `gamma` (1), `quality` (80), `frame` | Auto-stretched JPEG of the latest frame, or of frame `frame` while it is among the last three served. Headers `X-Frame-Number`, `X-Frame-Width`, `X-Frame-Height` (size of the original frame). |
 | GET | `/frame-info` | `cropSize` (31, 0..128, 0 = none), `secondaries` (0, 0..8), `frame` | `{ frameNumber, timestamp, width, height, bitDepth, lockX, lockY, stars, primaryCrop, secondaryCrops, levels }`. `primaryCrop` is `{ x0, y0, width, height, pixels }`, the raw pixels around the primary star (`null` without one). `secondaryCrops` is `[{ star, crop }]` for the strongest secondaries that are stars, highest SNR first. |
 

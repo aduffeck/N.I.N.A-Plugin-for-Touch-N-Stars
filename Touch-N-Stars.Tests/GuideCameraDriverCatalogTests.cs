@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using TouchNStars.Server.Models;
 using Xunit;
 
@@ -30,7 +31,8 @@ public class GuideCameraDriverCatalogTests
                 new INDIDriver { Name = "indi_custom_camera", Label = "Custom camera", Type = "camera" }
             };
             var drivers = GuideCameraDriverCatalog.GetDrivers(configured, directory);
-            Assert.Equal(3, drivers.Count);
+            Assert.Equal(3, drivers.Count(driver => !driver.Name.StartsWith("sdk:")));
+            Assert.Contains(drivers, driver => driver.Name == "sdk:svbony");
             Assert.Contains(drivers, driver => driver.Name == "indi_asi_ccd");
             Assert.Contains(drivers, driver => driver.Name == "indi_custom_camera");
             Assert.Contains(drivers, driver => driver.Label == "My USB guide camera");
@@ -47,6 +49,7 @@ public class GuideCameraDriverCatalogTests
     {
         var configured = new[] { new INDIDriver { Name = "indi_custom", Label = "Custom", Type = "camera" } };
         var drivers = GuideCameraDriverCatalog.GetDrivers(configured, Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString()));
-        Assert.Equal("indi_custom", Assert.Single(drivers).Name);
+        Assert.Equal("indi_custom", Assert.Single(drivers.Where(driver => !driver.Name.StartsWith("sdk:"))).Name);
+        Assert.Equal(11, drivers.Count(driver => driver.Name.StartsWith("sdk:")));
     }
 }
