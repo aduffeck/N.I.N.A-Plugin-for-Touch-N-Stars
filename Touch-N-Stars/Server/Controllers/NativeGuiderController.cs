@@ -13,6 +13,7 @@ using NINA.Core.Utility;
 using NINA.Equipment.Equipment.MyGuider.Advanced;
 using NINA.Equipment.Interfaces;
 using TouchNStars.Server.Services;
+using TouchNStars.Server.Models;
 
 namespace TouchNStars.Server.Controllers;
 
@@ -42,6 +43,20 @@ public partial class NativeGuiderController : WebApiController
     private NativeGuiderService Service { get; }
 
     #region Data
+
+    /// <summary>Guide camera driver registry, augmented with installed INDI CCD manifests. Available before connecting.</summary>
+    [Route(HttpVerbs.Get, "/native-guider/camera-drivers")]
+    public Task GetCameraDrivers()
+    {
+        try
+        {
+            return SendOk(GuideCameraDriverCatalog.GetDrivers(INDIDriverRegistry.GetDrivers("camera"), "/usr/share/indi"));
+        }
+        catch (Exception ex)
+        {
+            return SendException("camera-drivers", ex);
+        }
+    }
 
     /// <summary>GET /api/native-guider/status - device summary, guider status and contract version; always 200 so it can be polled.</summary>
     [Route(HttpVerbs.Get, "/native-guider/status")]
