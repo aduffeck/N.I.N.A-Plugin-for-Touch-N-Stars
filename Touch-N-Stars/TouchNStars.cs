@@ -1,6 +1,7 @@
 ﻿using NINA.Astrometry.Interfaces;
 using NINA.Core.Utility;
 using NINA.Core.Utility.Notification;
+using NINA.Equipment.Interfaces;
 using NINA.Equipment.Interfaces.Mediator;
 using NINA.Equipment.Equipment.MyTelescope;
 using NINA.Image.Interfaces;
@@ -49,7 +50,8 @@ namespace TouchNStars {
         ITwilightCalculator twilightCalculator,
         ISymbolBroker symbolBroker,
         IFocuserMediator focuser,
-        IOptionsVM options) {
+        IOptionsVM options,
+        IAdvancedGuider internalGuider) {
 
         public readonly IDeepSkyObjectSearchVM DeepSkyObjectSearchVM = DeepSkyObjectSearchVM;
         public readonly IImageDataFactory ImageDataFactory = ImageDataFactory;
@@ -70,6 +72,8 @@ namespace TouchNStars {
         public readonly IFocuserMediator Focuser = focuser;
         // Holds NINA's pluggable-behavior selectors, e.g. which auto-focuser runs AutoFocus.
         public readonly IOptionsVM Options = options;
+        // pins: the internal guider (also while another guider is selected), exported by pins to plugins.
+        public readonly IAdvancedGuider InternalGuider = internalGuider;
     }
 
     [Export(typeof(IPluginManifest))]
@@ -110,7 +114,8 @@ namespace TouchNStars {
                     ITwilightCalculator twilightCalculator,
                     ISymbolBroker symbolBroker,
                     IFocuserMediator focuserMediator,
-                    IOptionsVM optionsVM) {
+                    IOptionsVM optionsVM,
+                    IAdvancedGuider internalGuider) {
             if (Settings.Default.UpdateSettings) {
                 Settings.Default.Upgrade();
                 Settings.Default.UpdateSettings = false;
@@ -137,7 +142,8 @@ namespace TouchNStars {
                             twilightCalculator,
                             symbolBroker,
                             focuserMediator,
-                            optionsVM);
+                            optionsVM,
+                            internalGuider);
 
             UpdateDefaultPortCommand = new CommunityToolkit.Mvvm.Input.RelayCommand(() => {
                 Port = CachedPort;

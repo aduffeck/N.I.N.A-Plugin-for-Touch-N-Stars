@@ -46,6 +46,7 @@ namespace TouchNStars.Server {
                 .WithController<AutofocusController>()   // Autofocus control
                 .WithController<DialogController>()      // Dialog endpoints
                 .WithController<PHD2Controller>()        // PHD2 guiding endpoints
+                .WithController<InternalGuiderController>() // pins internal guider (IAdvancedGuider) endpoints
                 .WithController<TelescopiusController>() // Telescopius PIAAPI proxy
                 .WithController<MessageBoxController>()  // TNS MessageBox management
                 .WithController<SystemController>()      // System control (shutdown/restart)
@@ -78,6 +79,7 @@ namespace TouchNStars.Server {
                 .WithController<NightSummaryController>()
                 .WithController<GroundStationController>());
             WebServer = WebServer.WithModule(new MountControlSocket("/ws/mount-control")); // Manual (press-hold) mount slewing, INDI-direct
+            WebServer = WebServer.WithModule(new InternalGuiderSocket("/ws/internal-guider")); // Live feed of the pins internal guider
             WebServer = WebServer.WithStaticFolder(
                 StellariumLandscapeService.UserLandscapesRoute,
                 userLandscapesDir,
@@ -114,6 +116,7 @@ namespace TouchNStars.Server {
         public void Stop() {
             try {
                 FlatTargetNameService.Stop();
+                InternalGuiderService.Instance.StopWatching();
                 apiToken?.Cancel();
                 foreach (HipsSurveyService survey in HipsSurveyService.All) {
                     survey.CancelDownload();
