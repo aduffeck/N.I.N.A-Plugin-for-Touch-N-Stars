@@ -68,6 +68,7 @@ The guide camera is the one in the guide camera slot of pins' equipment: choose 
 | POST | `/stop-guiding` | | Stop guiding through N.I.N.A.'s guider mediator. `{ action, state }`. |
 | POST | `/pause`, `/resume` | | Pause or resume guiding; exposures continue. `{ action, state }`. |
 | POST | `/dither` | `pixels` (0 < pixels <= 100), `raOnly` (false) | 202 `{ action: "dither", accepted, pixels, raOnly }`. Without `pixels`, N.I.N.A.'s dither settings apply. Settling is reported by `settle` messages. 409 while a dither started here still runs. |
+| POST | `/select-star` | `x`, `y` (camera px, as in `/frame-info`; required) | Make the star nearest (x, y), within the search region, the guide star; only while looping without guiding. In multi-star mode its secondary stars are found around it. Answers after the next frame: `{ action: "select-star", star, secondaryStars, state }` (`star` is an `AdvancedGuideStar`). 409 `Rejected` with `messageCode` `NoStar`, `NearEdge`, `Busy` (guiding, calibrating, Coach), `NotLooping`, `Cancelled` or `TimedOut`; 400 without a position. |
 | POST | `/clear-calibration` | | Forget the calibration. `{ action, state }`. |
 | POST | `/darks/build` | `{ minExposure: 0.5, maxExposure: 4, frames: 5 }` (seconds; all optional) | 202 `{ action: "darks", accepted, minExposure, maxExposure, frames }`. The guide scope must be covered and the guider stopped (409 otherwise). Progress arrives as `darks` messages. |
 | POST | `/darks/cancel` | | `{ action: "darks-cancel" }`; 409 when no build runs. |

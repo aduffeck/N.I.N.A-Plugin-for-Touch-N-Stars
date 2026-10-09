@@ -277,6 +277,33 @@ public partial class InternalGuiderController : WebApiController
         });
     }
 
+    /// <summary>
+    /// POST /api/internal-guider/select-star?x=..&amp;y=.. - select the star nearest (x, y) (camera px, as in /frame-info) as the
+    /// guide star, while looping without guiding. Answers once the next frame was processed: { action, star, secondaryStars, state };
+    /// 409 Rejected with messageCode NoStar, NearEdge, Busy, NotLooping, Cancelled or TimedOut.
+    /// </summary>
+    [Route(HttpVerbs.Post, "/internal-guider/select-star")]
+    public Task SelectStar()
+    {
+        return WithConnectedGuiderAsync("select-star", async guider =>
+        {
+            double? x = QueryNullableDouble("x");
+            double? y = QueryNullableDouble("y");
+            if (!x.HasValue || !y.HasValue || x.Value < 0 || y.Value < 0)
+            {
+                await SendError(400, "InvalidRequest", "'x' and 'y' (camera px) are required.");
+                return;
+            }
+            AdvancedStarSelectionResult result = await guider.SelectGuideStar(x.Value, y.Value, HttpContext.CancellationToken);
+            if (result == null || !result.Success)
+            {
+                await SendError(409, "Rejected", result?.Message ?? "The guide star could not be selected.", result?.Error, null);
+                return;
+            }
+            await SendOk(new { action = "select-star", star = result.Star, secondaryStars = result.SecondaryStars, state = guider.State });
+        });
+    }
+
     /// <summary>POST /api/internal-guider/darks/build - body { minExposure, maxExposure, frames }; 202, progress as 'darks' messages.</summary>
     [Route(HttpVerbs.Post, "/internal-guider/darks/build")]
     public Task BuildDarks()

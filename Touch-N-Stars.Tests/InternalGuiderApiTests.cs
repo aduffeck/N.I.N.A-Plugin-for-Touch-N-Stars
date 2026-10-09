@@ -345,6 +345,66 @@ public class InternalGuiderActionApiTests
     }
 
     [Fact]
+    public async Task SelectStar_PassesThePositionAndAnswersTheStar()
+    {
+        var fake = new FakeInternalGuider { State = "Selected" };
+        fake.OnCall = (name, _) => name == nameof(IAdvancedGuider.SelectGuideStar)
+            ? Task.FromResult(new AdvancedStarSelectionResult
+            {
+                Success = true,
+                Star = new AdvancedGuideStar { X = 101.5, Y = 55.25, Snr = 30, IsPrimary = true, Used = true, Weight = 1 },
+                SecondaryStars = 7
+            })
+            : null;
+        using var host = new InternalGuiderApiHost(fake.Mediator);
+
+        (int status, JObject json) = await host.Post("select-star?x=101.2&y=55");
+
+        Assert.Equal(200, status);
+        Assert.Equal("select-star", (string?)json["response"]!["action"]);
+        Assert.Equal(101.5, (double)json["response"]!["star"]!["x"]!);
+        Assert.Equal(55.25, (double)json["response"]!["star"]!["y"]!);
+        Assert.Equal(7, (int)json["response"]!["secondaryStars"]!);
+        Assert.Equal("Selected", (string?)json["response"]!["state"]);
+        var call = Assert.Single(fake.CallsOf(nameof(IAdvancedGuider.SelectGuideStar)));
+        Assert.Equal(101.2, (double)call![0]!);
+        Assert.Equal(55.0, (double)call[1]!);
+    }
+
+    [Fact]
+    public async Task SelectStar_RejectedByTheGuider_Answers409WithTheReason()
+    {
+        var fake = new FakeInternalGuider { State = "Looping" };
+        fake.OnCall = (name, _) => name == nameof(IAdvancedGuider.SelectGuideStar)
+            ? Task.FromResult(new AdvancedStarSelectionResult { Error = AdvancedStarSelectionErrors.NoStar, Message = "No star was found at that position." })
+            : null;
+        using var host = new InternalGuiderApiHost(fake.Mediator);
+
+        (int status, JObject json) = await host.Post("select-star?x=10&y=20");
+
+        Assert.Equal(409, status);
+        Assert.Equal("Rejected", (string?)json["code"]);
+        Assert.Equal("NoStar", (string?)json["messageCode"]);
+        Assert.Equal("No star was found at that position.", (string?)json["error"]);
+    }
+
+    [Theory]
+    [InlineData("select-star")]
+    [InlineData("select-star?x=10")]
+    [InlineData("select-star?x=-1&y=5")]
+    public async Task SelectStar_WithoutAPosition_Answers400(string path)
+    {
+        var fake = new FakeInternalGuider();
+        using var host = new InternalGuiderApiHost(fake.Mediator);
+
+        (int status, JObject json) = await host.Post(path);
+
+        Assert.Equal(400, status);
+        Assert.Equal("InvalidRequest", (string?)json["code"]);
+        Assert.Empty(fake.CallsOf(nameof(IAdvancedGuider.SelectGuideStar)));
+    }
+
+    [Fact]
     public async Task Action_StillRunning_Answers202AndPublishesTheOutcomeLater()
     {
         var fake = new FakeInternalGuider { State = "Guiding" };

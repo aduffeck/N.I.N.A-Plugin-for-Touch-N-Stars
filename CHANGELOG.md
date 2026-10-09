@@ -1,6 +1,7 @@
 # Touch 'N' Stars
 
 ## Unreleased
+- Internal guider API: `POST /api/internal-guider/select-star` makes the star nearest a position in the guide frame the guide star while the guider is looping, for choosing the guide star by tapping it; see `INTERNAL_GUIDER_API.md`
 - Persistent Celestia Atlas data (landscapes, DSS survey) now lives in `NINA\TnsCache` next to the other plugin data; an existing `NINA\Touch-N-Stars` tree is moved there once
 - Atlas DSS survey download: new `/api/atlas/survey/*` endpoints (status, download, cancel, delete) fetch the DSS colour HiPS tile by tile onto the host as 512 px JPEG and serve it at `/celestia-atlas-data/surveys/dss` from the persistent data directory; resumable, one job at a time
 - Atlas DSS survey delete now accepts an optional `keepOrder` to downgrade to a lower order instead of always wiping the whole survey
