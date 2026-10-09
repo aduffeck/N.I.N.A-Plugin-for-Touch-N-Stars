@@ -64,7 +64,7 @@ The guide camera is the one in the guide camera slot of pins' equipment: choose 
 |---|---|---|---|
 | POST | `/loop` | | Start looping exposures. `{ action, state }`. |
 | POST | `/stop` | | Stop guiding (through N.I.N.A.) and all exposures. `{ action, state }`. |
-| POST | `/start-guiding` | `calibrate` (false) | 202 `{ action: "start-guiding" \| "calibrate", accepted }`. Guiding starts through N.I.N.A.'s guider mediator; `calibrate=true` forces a new calibration. |
+| POST | `/start-guiding` | `calibrate` (false) | 202 `{ action: "start-guiding" \| "calibrate", accepted }`. Guiding starts through N.I.N.A.'s guider mediator; `calibrate=true` forces a new calibration. A start while another is still calibrating or settling replaces it, and both report the newer one's outcome. |
 | POST | `/stop-guiding` | | Stop guiding through N.I.N.A.'s guider mediator. `{ action, state }`. |
 | POST | `/pause`, `/resume` | | Pause or resume guiding; exposures continue. `{ action, state }`. |
 | POST | `/dither` | `pixels` (0 < pixels <= 100), `raOnly` (false) | 202 `{ action: "dither", accepted, pixels, raOnly }`. Without `pixels`, N.I.N.A.'s dither settings apply. Settling is reported by `settle` messages. 409 while a dither started here still runs. |
@@ -86,8 +86,8 @@ The guide camera is the one in the guide camera slot of pins' equipment: choose 
 
 ## Flight recorder (incidents)
 
-Incidents can be reviewed while the internal guider is selected but not connected; only `mark` needs a
-connected guider. Incident ids (`yyyyMMdd-HHmmss-Kind[-n]`) consist of ASCII letters, digits and `-`, at most
+Incidents can be reviewed while the internal guider is not connected, also while another guider such as PHD2 is;
+only `mark` needs the internal guider connected. Incident ids (`yyyyMMdd-HHmmss-Kind[-n]`) consist of ASCII letters, digits and `-`, at most
 100 characters; any other id is answered with 400 before it reaches the guider.
 
 | Method | Route | Parameters | Response |

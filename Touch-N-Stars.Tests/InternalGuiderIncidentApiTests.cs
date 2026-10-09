@@ -88,6 +88,26 @@ public class InternalGuiderIncidentApiTests
     }
 
     [Fact]
+    public async Task List_WorksWhileAnotherGuiderIsConnected_MarkDoesNot()
+    {
+        FakeInternalGuider fake = WithIncidents();
+        fake.Connected = false;
+        using var host = new InternalGuiderApiHost(FakeInternalGuider.PlainGuiderMediator(), fake.Guider);
+
+        (int list, JObject listJson) = await host.Get("incidents");
+        Assert.Equal(200, list);
+        Assert.Equal(3, listJson["response"]!["incidents"]!.Count());
+
+        (int get, _) = await host.Get($"incidents/{Id}");
+        Assert.Equal(200, get);
+
+        (int mark, JObject markJson) = await host.Post("incidents/mark");
+        Assert.Equal(409, mark);
+        Assert.Equal("NotAvailable", (string?)markJson["code"]);
+        Assert.Empty(fake.CallsOf(nameof(IGuideIncidentRecorder.MarkIncident)));
+    }
+
+    [Fact]
     public async Task Get_ReturnsTheIncidentWithItsFrames()
     {
         using var host = new InternalGuiderApiHost(WithIncidents().Mediator);

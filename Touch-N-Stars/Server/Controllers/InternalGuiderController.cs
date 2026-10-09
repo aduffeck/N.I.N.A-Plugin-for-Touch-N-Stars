@@ -399,14 +399,16 @@ public partial class InternalGuiderController : WebApiController
     /// Runs <paramref name="handler"/> with the connected internal guider or, unless <paramref name="requireConnected"/>,
     /// the guider chooser's internal guider while it is not connected. 409 NotAvailable without one, 500 on errors.
     /// </summary>
-    private async Task WithGuiderAsync(string what, bool requireConnected, Func<IAdvancedGuider, Task> handler)
+    private async Task WithGuiderAsync(string what, bool requireConnected, Func<IAdvancedGuider, Task> handler, bool forIncidents = false)
     {
         try
         {
             string reason;
             IAdvancedGuider guider = requireConnected
                 ? Service.GetConnectedGuider(out reason)
-                : Service.GetConfigurableGuider(out _, out reason);
+                : forIncidents
+                    ? Service.GetIncidentGuider(out reason)
+                    : Service.GetConfigurableGuider(out _, out reason);
             if (guider == null)
             {
                 await SendNotAvailable(reason);

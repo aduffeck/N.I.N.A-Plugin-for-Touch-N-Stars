@@ -206,12 +206,16 @@ public partial class InternalGuiderController
         });
     }
 
-    /// <summary>The incident routes: the internal guider (see <see cref="WithGuiderAsync"/>), 501 when it has no <see cref="IGuideIncidentRecorder"/>.</summary>
+    /// <summary>
+    /// The incident routes: the connected internal guider or, unless <paramref name="requireConnected"/>, the internal
+    /// guider also while it or another guider is connected (<see cref="InternalGuiderService.GetIncidentGuider"/>); 501
+    /// when it has no <see cref="IGuideIncidentRecorder"/>.
+    /// </summary>
     private Task WithRecorderAsync(string what, bool requireConnected, Func<IGuideIncidentRecorder, Task> handler)
     {
         return WithGuiderAsync(what, requireConnected, guider => guider is IGuideIncidentRecorder recorder
             ? handler(recorder)
-            : SendNotSupported("the flight recorder"));
+            : SendNotSupported("the flight recorder"), forIncidents: true);
     }
 
     /// <summary>

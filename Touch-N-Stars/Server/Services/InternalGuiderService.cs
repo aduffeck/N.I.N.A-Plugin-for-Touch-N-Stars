@@ -142,6 +142,30 @@ public sealed class InternalGuiderService
         return null;
     }
 
+    /// <summary>
+    /// The guider whose incidents are reviewed: the connected advanced guider, else the internal guider, also while
+    /// another guider (e.g. PHD2) is connected. Incidents are the internal guider's own files; reading or deleting them
+    /// does not touch the device in use.
+    /// </summary>
+    public IAdvancedGuider GetIncidentGuider(out string reason)
+    {
+        IAdvancedGuider guider = GetConnectedGuider(out reason);
+        if (guider != null)
+        {
+            return guider;
+        }
+
+        IAdvancedGuider internalGuider = internalGuiderProvider?.Invoke();
+        if (internalGuider != null)
+        {
+            reason = null;
+            return internalGuider;
+        }
+
+        reason ??= "The Internal Guider is not available.";
+        return null;
+    }
+
     private static IDevice SafeGetDevice(IGuiderMediator mediator)
     {
         try
@@ -428,8 +452,9 @@ public sealed class InternalGuiderService
     {
         IGuiderMediator mediator = Mediator;
         var cts = new CancellationTokenSource();
-        CancellationTokenSource previous = Interlocked.Exchange(ref guidingStartCts, cts);
-        try { previous?.Cancel(); } catch (ObjectDisposedException) { }
+        // A start still in flight is not cancelled: the guider lets the newer one carry on and gives both its outcome.
+        // Cancelling it would stop capturing under the newer one.
+        Interlocked.Exchange(ref guidingStartCts, cts);
 
         _ = Task.Run(async () =>
         {
@@ -452,6 +477,7 @@ public sealed class InternalGuiderService
             finally
             {
                 Interlocked.CompareExchange(ref guidingStartCts, null, cts);
+                cts.Dispose();
             }
             PublishAction(forceCalibration ? "calibrate" : "start-guiding", ok, error);
         });
