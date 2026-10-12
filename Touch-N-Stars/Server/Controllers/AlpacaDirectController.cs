@@ -26,6 +26,8 @@ public class AlpacaDirectController : WebApiController
     private static readonly Dictionary<string, Guid> DeviceGuids = new(StringComparer.OrdinalIgnoreCase)
     {
         ["camera"] = Guid.Parse("01E42001-1A8B-44AA-AD7E-CE8F5250F1F4"),
+        // PINS' guide camera slot keeps its own static IP (NINA.Equipment AlpacaInteraction.GuideAlpacaDirectCameraId).
+        ["guidecamera"] = Guid.Parse("6C9035BF-9F7E-4FA2-8743-8D29026BCC5D"),
         ["telescope"] = Guid.Parse("F98BB2D7-A53B-456C-A3B0-CC1CC0F3A40E"),
         ["focuser"] = Guid.Parse("75ABC27F-85F6-4993-B42C-C66E1F5726E3"),
         ["filterwheel"] = Guid.Parse("2F95FB1C-46ED-4F2C-8072-273F07567DD7"),
@@ -40,7 +42,7 @@ public class AlpacaDirectController : WebApiController
     /// <summary>
     /// GET /api/alpaca-direct/{deviceType}/settings
     /// Returns the current AlpacaDirect settings for the specified device type.
-    /// deviceType: camera | telescope | focuser | filterwheel | dome | rotator | safetymonitor | switch | flatdevice | weather
+    /// deviceType: camera | guidecamera | telescope | focuser | filterwheel | dome | rotator | safetymonitor | switch | flatdevice | weather
     /// </summary>
     [Route(HttpVerbs.Get, "/alpaca-direct/{deviceType}/settings")]
     public ApiResponse GetSettings(string deviceType)
