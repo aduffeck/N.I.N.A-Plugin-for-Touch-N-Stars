@@ -425,13 +425,14 @@ public class INDIController : WebApiController
                 Description = GetSerialPortDescription(p)
             }).ToList();
 
-            var byIdLinks = GetSerialByIdLinks();
+            var byIdLinks = GetSerialLinks("/dev/serial/by-id");
+            var byPathLinks = GetSerialLinks("/dev/serial/by-path");
 
             HttpContext.Response.StatusCode = 200;
             return new ApiResponse
             {
                 Success = true,
-                Response = new { Ports = portInfos, ByIdLinks = byIdLinks },
+                Response = new { Ports = portInfos, ByIdLinks = byIdLinks, ByPathLinks = byPathLinks },
                 StatusCode = 200,
                 Type = "SerialPorts"
             };
@@ -496,33 +497,60 @@ public class INDIController : WebApiController
         }
     }
 
-    private static List<object> GetSerialByIdLinks()
+    /// <summary>
+    /// Lists the udev symlinks in /dev/serial/by-id or /dev/serial/by-path. by-path names the physical
+    /// USB port, which stays stable for adapters without a serial number (e.g. CH34x) whose by-id
+    /// links collide or are missing.
+    /// </summary>
+    private static List<object> GetSerialLinks(string linkDir)
     {
         var result = new List<object>();
-        var byIdPath = "/dev/serial/by-id";
-        if (!Directory.Exists(byIdPath))
+        if (!Directory.Exists(linkDir))
             return result;
 
         try
         {
-            foreach (var link in Directory.GetFiles(byIdPath).OrderBy(s => s))
+            var links = Directory.GetFiles(linkDir).OrderBy(s => s).ToList();
+            var linkNames = links.Select(Path.GetFileName).ToHashSet();
+
+            foreach (var link in links)
             {
                 var linkName = Path.GetFileName(link);
+
+                // Newer udev adds a "-usbv2-" by-path link next to the legacy "-usb-" one for the same port
+                if (linkName.Contains("-usbv2-") && linkNames.Contains(linkName.Replace("-usbv2-", "-usb-")))
+                    continue;
+
                 var resolvedPath = "";
                 try
                 {
                     var target = new FileInfo(link).LinkTarget;
                     if (target != null)
-                        resolvedPath = Path.GetFullPath(Path.Combine(byIdPath, target));
+                        resolvedPath = Path.GetFullPath(Path.Combine(linkDir, target));
                 }
                 catch { }
 
-                result.Add(new { Id = linkName, Path = $"{byIdPath}/{linkName}", ResolvedPort = resolvedPath });
+                var description = "";
+                if (!string.IsNullOrEmpty(resolvedPath))
+                {
+                    var portDescription = GetSerialPortDescription(resolvedPath);
+                    description = string.IsNullOrEmpty(portDescription)
+                        ? Path.GetFileName(resolvedPath)
+                        : $"{Path.GetFileName(resolvedPath)} - {portDescription}";
+                }
+
+                result.Add(new
+                {
+                    Id = linkName,
+                    Path = $"{linkDir}/{linkName}",
+                    ResolvedPort = resolvedPath,
+                    Description = description
+                });
             }
         }
         catch (Exception ex)
         {
-            Logger.Error($"Error enumerating /dev/serial/by-id: {ex}");
+            Logger.Error($"Error enumerating {linkDir}: {ex}");
         }
 
         return result;
