@@ -50,10 +50,11 @@ public sealed class InternalGuiderService
     private const int JpegCacheSize = 4;
     private static readonly TimeSpan WatchInterval = TimeSpan.FromSeconds(2);
 
-    public static InternalGuiderService Instance { get; } = new(() => TouchNStars.Mediators?.Guider, () => TouchNStars.Mediators?.InternalGuider);
+    public static InternalGuiderService Instance { get; } = new(() => TouchNStars.Mediators?.Guider, () => TouchNStars.Mediators?.InternalGuider, () => TouchNStars.Mediators?.Telescope);
 
     private readonly Func<IGuiderMediator> mediatorProvider;
     private readonly Func<IAdvancedGuider> internalGuiderProvider;
+    private readonly Func<ITelescopeMediator> telescopeProvider;
     private readonly object sync = new();
     private readonly LinkedList<AdvancedGuiderFrame> recentFrames = new();
     private readonly LinkedList<(string Key, ushort[] Pixels, byte[] Jpeg)> jpegCache = new();
@@ -64,12 +65,16 @@ public sealed class InternalGuiderService
     private CancellationTokenSource guidingStartCts;
     private CancellationTokenSource darksCts;
     private int ditherRunning;
+    private int calibrationSlewRunning;
 
     /// <param name="internalGuiderProvider">The internal guider, also while it is not connected (pins exports it to plugins).</param>
-    public InternalGuiderService(Func<IGuiderMediator> mediatorProvider, Func<IAdvancedGuider> internalGuiderProvider = null)
+    /// <param name="telescopeProvider">The mount, for the slew to the calibration position.</param>
+    public InternalGuiderService(Func<IGuiderMediator> mediatorProvider, Func<IAdvancedGuider> internalGuiderProvider = null,
+        Func<ITelescopeMediator> telescopeProvider = null)
     {
         this.mediatorProvider = mediatorProvider;
         this.internalGuiderProvider = internalGuiderProvider;
+        this.telescopeProvider = telescopeProvider;
     }
 
     /// <summary>
@@ -79,6 +84,11 @@ public sealed class InternalGuiderService
     public event Action<InternalGuiderEvent> EventReceived;
 
     public IGuiderMediator Mediator => mediatorProvider();
+
+    public ITelescopeMediator Telescope => telescopeProvider?.Invoke();
+
+    /// <summary>True while a start-guiding call slews to the calibration position (before its calibration).</summary>
+    public bool CalibrationSlewInProgress => Volatile.Read(ref calibrationSlewRunning) != 0;
 
     #region Guider resolution
 
@@ -448,9 +458,20 @@ public sealed class InternalGuiderService
     /// its state stays consistent) without waiting for calibration and settling to finish. The
     /// outcome is published as an 'action' event.
     /// </summary>
-    public void StartGuidingInBackground(bool forceCalibration)
+    /// <param name="calibrationSlew">
+    /// Slew to the calibration position on this side first (only with <paramref name="forceCalibration"/>). The guider stops
+    /// capturing for the slew; a slew that fails or is cancelled (<see cref="CancelGuidingStart"/>) starts no calibration.
+    /// </param>
+    /// <returns>False while a slew to the calibration position runs; nothing is started then.</returns>
+    public bool StartGuidingInBackground(bool forceCalibration, CalibrationSlewSide? calibrationSlew = null)
     {
+        bool rejected = calibrationSlew.HasValue
+            ? Interlocked.CompareExchange(ref calibrationSlewRunning, 1, 0) != 0
+            : CalibrationSlewInProgress;
+        if (rejected) return false;
+
         IGuiderMediator mediator = Mediator;
+        ITelescopeMediator telescope = Telescope;
         var cts = new CancellationTokenSource();
         // A start still in flight is not cancelled: the guider lets the newer one carry on and gives both its outcome.
         // Cancelling it would stop capturing under the newer one.
@@ -460,27 +481,41 @@ public sealed class InternalGuiderService
         {
             bool ok = false;
             string error = null;
+            bool slewing = calibrationSlew.HasValue;
             try
             {
+                if (slewing)
+                {
+                    // No guide exposures during the slew: the star would be lost anyway, and the calibration picks a new one.
+                    await mediator.StopGuiding(cts.Token).ConfigureAwait(false);
+                    await CalibrationSlew.SlewAsync(telescope, calibrationSlew.Value, cts.Token).ConfigureAwait(false);
+                    slewing = false;
+                    Interlocked.Exchange(ref calibrationSlewRunning, 0);
+                }
                 ok = await mediator.StartGuiding(forceCalibration, null, cts.Token).ConfigureAwait(false);
                 if (!ok) error = "The guider did not start guiding. Check the event log for the reason.";
             }
             catch (OperationCanceledException)
             {
-                error = "Start of guiding was cancelled.";
+                error = slewing ? "The slew to the calibration position was cancelled." : "Start of guiding was cancelled.";
             }
             catch (Exception ex)
             {
                 Logger.Error($"InternalGuider: start guiding failed: {ex}");
-                error = ex.Message;
+                // CalibrationSlew's own failures already say what happened.
+                error = slewing && ex is not InvalidOperationException
+                    ? $"The slew to the calibration position failed: {ex.Message}"
+                    : ex.Message;
             }
             finally
             {
+                if (calibrationSlew.HasValue) Interlocked.Exchange(ref calibrationSlewRunning, 0);
                 Interlocked.CompareExchange(ref guidingStartCts, null, cts);
                 cts.Dispose();
             }
             PublishAction(forceCalibration ? "calibrate" : "start-guiding", ok, error);
         });
+        return true;
     }
 
     /// <summary>Cancels a pending start (calibration/settling) issued through this API.</summary>

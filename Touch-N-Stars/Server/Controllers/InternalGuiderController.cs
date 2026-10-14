@@ -60,6 +60,7 @@ public partial class InternalGuiderController : WebApiController
                 device.DeviceName,
                 device.IsNative,
                 reason,
+                calibrationSlew = Service.CalibrationSlewInProgress,
                 status = guider?.GetStatus()
             });
         }
@@ -227,15 +228,44 @@ public partial class InternalGuiderController : WebApiController
         return await guider.StopLooping(ct);
     });
 
-    /// <summary>POST /api/internal-guider/start-guiding?calibrate=false - start guiding through NINA; 202, outcome as 'action' message.</summary>
+    /// <summary>
+    /// POST /api/internal-guider/start-guiding?calibrate=false&amp;slew=stay|east|west - start guiding through NINA; 202, outcome as
+    /// 'action' message. With calibrate=true, slew first slews to a calibration position on that side of the meridian.
+    /// </summary>
     [Route(HttpVerbs.Post, "/internal-guider/start-guiding")]
     public Task StartGuiding()
     {
         return WithConnectedGuiderAsync("start-guiding", guider =>
         {
             bool calibrate = QueryBool("calibrate", false);
-            Service.StartGuidingInBackground(calibrate);
-            return SendJson(202, new { success = true, response = new { action = calibrate ? "calibrate" : "start-guiding", accepted = true } });
+            string slewValue = Query("slew");
+            CalibrationSlewSide? slew = null;
+            if (!string.IsNullOrWhiteSpace(slewValue))
+            {
+                if (!CalibrationSlew.TryParseSide(slewValue, out CalibrationSlewSide side))
+                {
+                    return SendError(400, "InvalidRequest", "'slew' must be stay, east or west.");
+                }
+                if (!calibrate)
+                {
+                    return SendError(400, "InvalidRequest", "'slew' needs calibrate=true.");
+                }
+                string blocker = CalibrationSlew.Blocker(Service.Telescope?.GetInfo());
+                if (blocker != null)
+                {
+                    return SendError(409, "Rejected", blocker);
+                }
+                slew = side;
+            }
+            if (!Service.StartGuidingInBackground(calibrate, slew))
+            {
+                return SendError(409, "Rejected", "The mount is slewing to the calibration position.");
+            }
+            return SendJson(202, new
+            {
+                success = true,
+                response = new { action = calibrate ? "calibrate" : "start-guiding", accepted = true, slew = slew?.ToString().ToLowerInvariant() }
+            });
         });
     }
 

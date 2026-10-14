@@ -25,10 +25,11 @@ internal sealed class InternalGuiderApiHost : IDisposable
     private readonly HttpClient client;
 
     /// <param name="internalGuider">The internal guider pins exports to plugins (also while it is not connected).</param>
-    public InternalGuiderApiHost(IGuiderMediator mediator, IAdvancedGuider? internalGuider = null)
+    /// <param name="telescope">The mount, for the slew to the calibration position.</param>
+    public InternalGuiderApiHost(IGuiderMediator mediator, IAdvancedGuider? internalGuider = null, ITelescopeMediator? telescope = null)
     {
         // A short wait so that "still running" calls answer 202 quickly in tests.
-        Service = new InternalGuiderService(() => mediator, () => internalGuider!)
+        Service = new InternalGuiderService(() => mediator, () => internalGuider!, () => telescope!)
         {
             CallTimeout = TimeSpan.FromMilliseconds(500)
         };
