@@ -188,6 +188,73 @@ public class PinsController : WebApiController
         }
     }
     /// <summary>
+    /// Reads a property for a safety check (read-only port, auto mode, limits): false when the property is missing, its
+    /// getter throws or the value is not a number. Such a check must then refuse, not pass: GetPropertyBool's false
+    /// made a read-only port switchable, and GetPropertyDouble's NaN limits let any voltage through.
+    /// </summary>
+    private static bool TryReadProperty(object obj, string propertyName, out object value)
+    {
+        value = null;
+        if (obj == null) return false;
+
+        try
+        {
+            var property = obj.GetType().GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+            if (property == null) return false;
+
+            value = property.GetValue(obj);
+            return value != null;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"PinsController: could not read {propertyName}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static bool TryGetPropertyBool(object obj, string propertyName, out bool result)
+    {
+        result = false;
+        if (TryReadProperty(obj, propertyName, out var value) && value is bool b)
+        {
+            result = b;
+            return true;
+        }
+        return false;
+    }
+
+    private static bool TryGetPropertyDouble(object obj, string propertyName, out double result)
+    {
+        result = double.NaN;
+        if (!TryReadProperty(obj, propertyName, out var value)) return false;
+        result = value switch { double d => d, float f => f, int i => i, _ => double.NaN };
+        return !double.IsNaN(result) && !double.IsInfinity(result);
+    }
+
+    private static bool TryGetPropertyInt(object obj, string propertyName, out int result)
+    {
+        result = 0;
+        if (TryReadProperty(obj, propertyName, out var value) && value is int i)
+        {
+            result = i;
+            return true;
+        }
+        return false;
+    }
+
+    private ApiResponse SafetyCheckUnavailable(string what)
+    {
+        HttpContext.Response.StatusCode = 503;
+        return new ApiResponse
+        {
+            Success = false,
+            Error = $"Cannot tell {what}; refusing the change",
+            StatusCode = 503,
+            Type = "Error"
+        };
+    }
+
+    /// <summary>
     /// GET /api/pins/powerbox - Get PowerBox device information
     /// </summary>
     [Route(HttpVerbs.Get, "/pins/powerbox")]
@@ -459,7 +526,10 @@ public class PinsController : WebApiController
             }
 
             // Check if port is read-only
-            bool isReadOnly = GetPropertyBool(targetPort, "ReadOnly");
+            if (!TryGetPropertyBool(targetPort, "ReadOnly", out bool isReadOnly))
+            {
+                return SafetyCheckUnavailable("whether the power port is read-only");
+            }
             if (isReadOnly)
             {
                 HttpContext.Response.StatusCode = 403;
@@ -923,7 +993,10 @@ public class PinsController : WebApiController
             }
 
             // Check if port is read-only
-            bool isReadOnly = GetPropertyBool(targetPort, "ReadOnly");
+            if (!TryGetPropertyBool(targetPort, "ReadOnly", out bool isReadOnly))
+            {
+                return SafetyCheckUnavailable("whether the USB port is read-only");
+            }
             if (isReadOnly)
             {
                 HttpContext.Response.StatusCode = 403;
@@ -1387,7 +1460,10 @@ public class PinsController : WebApiController
             }
 
             // Check if AutoMode is enabled - cannot manually control when in auto mode
-            bool autoMode = GetPropertyBool(targetPort, "AutoMode");
+            if (!TryGetPropertyBool(targetPort, "AutoMode", out bool autoMode))
+            {
+                return SafetyCheckUnavailable("whether the dew port is in auto mode");
+            }
             if (autoMode)
             {
                 HttpContext.Response.StatusCode = 403;
@@ -1929,7 +2005,10 @@ public class PinsController : WebApiController
             }
 
             // Check if AutoMode is enabled - cannot manually control when in auto mode
-            bool autoMode = GetPropertyBool(targetPort, "AutoMode");
+            if (!TryGetPropertyBool(targetPort, "AutoMode", out bool autoMode))
+            {
+                return SafetyCheckUnavailable("whether the dew port is in auto mode");
+            }
             if (autoMode)
             {
                 HttpContext.Response.StatusCode = 403;
@@ -1938,6 +2017,23 @@ public class PinsController : WebApiController
                     Success = false,
                     Error = "Cannot manually control dew port when AutoMode is enabled",
                     StatusCode = 403,
+                    Type = "Error"
+                };
+            }
+
+            // The level is the raw duty value 0..Resolution (e.g. 255); it went to the device unchecked
+            if (!TryGetPropertyInt(targetPort, "Resolution", out int resolution) || resolution <= 0)
+            {
+                return SafetyCheckUnavailable("the dew port's power range");
+            }
+            if (powerlevel < 0 || powerlevel > resolution)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = $"Power level {powerlevel} is outside valid range 0-{resolution}",
+                    StatusCode = 400,
                     Type = "Error"
                 };
             }
@@ -2508,11 +2604,15 @@ public class PinsController : WebApiController
                 };
             }
 
-            // Get the current limits for validation
-            double minVoltage = GetPropertyDouble(targetPort, "MinVoltage");
-            double maxVoltage = GetPropertyDouble(targetPort, "MaxVoltage");
+            // Get the current limits for validation: NaN limits passed any voltage
+            if (!TryGetPropertyDouble(targetPort, "MinVoltage", out double minVoltage)
+                || !TryGetPropertyDouble(targetPort, "MaxVoltage", out double maxVoltage)
+                || minVoltage > maxVoltage)
+            {
+                return SafetyCheckUnavailable("the buck converter's voltage limits");
+            }
 
-            if (voltage < minVoltage || voltage > maxVoltage)
+            if (double.IsNaN(voltage) || voltage < minVoltage || voltage > maxVoltage)
             {
                 HttpContext.Response.StatusCode = 400;
                 return new ApiResponse
