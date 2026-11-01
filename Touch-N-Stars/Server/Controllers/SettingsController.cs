@@ -1,4 +1,5 @@
 using TouchNStars.Server.Models;
+using TouchNStars.Utility;
 using EmbedIO;
 using EmbedIO.Routing;
 using EmbedIO.WebApi;
@@ -20,6 +21,11 @@ public class SettingsController : WebApiController
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "NINA", "TnsCache", "settings.json"
     );
+
+    private static readonly JsonSerializerOptions ReadOptions = new() { AllowTrailingCommas = true };
+    private static readonly JsonSerializerOptions WriteOptions = new() { WriteIndented = true };
+
+    // Guards every read-modify-write of the file and the cache below.
     private static readonly object _fileLock = new();
 
     // Cache for the static read path (see TryGetRawSetting). Guarded by _fileLock.
@@ -42,45 +48,50 @@ public class SettingsController : WebApiController
 
         lock (_fileLock)
         {
-            FileInfo info;
             try
             {
-                info = new FileInfo(SettingsFilePath);
-                if (!info.Exists)
+                var (stamp, length) = FileStamp();
+                if (_fileCache == null || stamp != _fileCacheStampUtc || length != _fileCacheLength)
                 {
-                    _fileCache = null;
-                    return false;
+                    // Load moves an unreadable file aside and may restore the backup, so the
+                    // stamp is taken afterwards: a file that stays unreadable or missing is
+                    // then not read (and warned about) again for every saved image.
+                    _fileCache = LoadLocked();
+                    (_fileCacheStampUtc, _fileCacheLength) = FileStamp();
                 }
             }
             catch (Exception ex)
             {
-                Logger.Warning($"Failed to stat the settings file: {ex.Message}");
+                Logger.Warning($"Failed to read the settings file: {ex.Message}");
                 _fileCache = null;
                 return false;
             }
 
-            if (_fileCache == null || info.LastWriteTimeUtc != _fileCacheStampUtc || info.Length != _fileCacheLength)
-            {
-                // Stamp before parsing, so an unreadable or corrupt file is remembered as
-                // such until it changes on disk - otherwise every saved image would re-read
-                // it and log the same warning again.
-                _fileCacheStampUtc = info.LastWriteTimeUtc;
-                _fileCacheLength = info.Length;
-
-                try
-                {
-                    var json = File.ReadAllText(SettingsFilePath);
-                    _fileCache = JsonSerializer.Deserialize<Dictionary<string, string>>(json, new JsonSerializerOptions { AllowTrailingCommas = true }) ?? new();
-                }
-                catch (Exception ex)
-                {
-                    Logger.Warning($"Failed to read the settings file: {ex.Message}");
-                    _fileCache = new();
-                }
-            }
-
             return _fileCache.TryGetValue(key, out value);
         }
+    }
+
+    private static (DateTime Stamp, long Length) FileStamp()
+    {
+        var info = new FileInfo(SettingsFilePath);
+        return info.Exists ? (info.LastWriteTimeUtc, info.Length) : (DateTime.MinValue, -1L);
+    }
+
+    // Callers hold _fileLock.
+    private static Dictionary<string, string> LoadLocked()
+    {
+        return JsonFileStore.Read(
+            SettingsFilePath,
+            json => JsonSerializer.Deserialize<Dictionary<string, string>>(json, ReadOptions) ?? new Dictionary<string, string>(),
+            () => new Dictionary<string, string>(),
+            "settings");
+    }
+
+    // Callers hold _fileLock.
+    private static void SaveLocked(Dictionary<string, string> settings)
+    {
+        JsonFileStore.Write(SettingsFilePath, JsonSerializer.Serialize(settings, WriteOptions));
+        _fileCache = null;
     }
 
     /// <summary>
@@ -105,24 +116,11 @@ public class SettingsController : WebApiController
                 };
             }
 
-            Dictionary<string, string> currentSettings = new();
-            if (File.Exists(SettingsFilePath))
-            {
-                var json = await File.ReadAllTextAsync(SettingsFilePath);
-                currentSettings = JsonSerializer.Deserialize<Dictionary<string, string>>(json, new JsonSerializerOptions { AllowTrailingCommas = true }) ?? new();
-            }
-
-            currentSettings[setting.Key] = setting.Value;
-
             lock (_fileLock)
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(SettingsFilePath));
-                var updatedJson = System.Text.Json.JsonSerializer.Serialize(
-                    currentSettings,
-                    new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
-
-                File.WriteAllText(SettingsFilePath, updatedJson);
-                _fileCache = null;
+                var currentSettings = LoadLocked();
+                currentSettings[setting.Key] = setting.Value;
+                SaveLocked(currentSettings);
             }
 
             return new ApiResponse
@@ -151,78 +149,78 @@ public class SettingsController : WebApiController
     /// GET /api/settings - Get all settings
     /// </summary>
     [Route(HttpVerbs.Get, "/settings")]
-    public async Task<Dictionary<string, string>> GetAllSettings()
+    public Task<Dictionary<string, string>> GetAllSettings()
     {
-        if (!File.Exists(SettingsFilePath)) return new Dictionary<string, string>();
-
-        var json = await File.ReadAllTextAsync(SettingsFilePath);
-        return JsonSerializer.Deserialize<Dictionary<string, string>>(json, new JsonSerializerOptions { AllowTrailingCommas = true }) ?? new Dictionary<string, string>();
+        try
+        {
+            lock (_fileLock)
+            {
+                return Task.FromResult(LoadLocked());
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            return Task.FromResult(new Dictionary<string, string>());
+        }
     }
 
     /// <summary>
     /// GET /api/settings/{key} - Get a specific setting by key
     /// </summary>
     [Route(HttpVerbs.Get, "/settings/{key}")]
-    public async Task<ApiResponse> GetSetting(string key)
+    public Task<ApiResponse> GetSetting(string key)
     {
         try
         {
             if (string.IsNullOrEmpty(key))
             {
                 HttpContext.Response.StatusCode = 400;
-                return new ApiResponse
+                return Task.FromResult(new ApiResponse
                 {
                     Success = false,
                     Error = "Key ist erforderlich",
                     StatusCode = 400,
                     Type = "Error"
-                };
+                });
             }
 
-            if (!File.Exists(SettingsFilePath))
+            Dictionary<string, string> settings;
+            lock (_fileLock)
             {
-                return new ApiResponse
+                settings = LoadLocked();
+            }
+
+            if (!settings.TryGetValue(key, out var value))
+            {
+                return Task.FromResult(new ApiResponse
                 {
                     Success = false,
                     Error = "Einstellung nicht gefunden",
                     StatusCode = 404,
                     Type = "NotFound"
-                };
+                });
             }
 
-            var json = await File.ReadAllTextAsync(SettingsFilePath);
-            var settings = JsonSerializer.Deserialize<Dictionary<string, string>>(json, new JsonSerializerOptions { AllowTrailingCommas = true }) ?? new();
-
-            if (!settings.ContainsKey(key))
-            {
-                return new ApiResponse
-                {
-                    Success = false,
-                    Error = "Einstellung nicht gefunden",
-                    StatusCode = 404,
-                    Type = "NotFound"
-                };
-            }
-
-            return new ApiResponse
+            return Task.FromResult(new ApiResponse
             {
                 Success = true,
-                Response = new Setting { Key = key, Value = settings[key] },
+                Response = new Setting { Key = key, Value = value },
                 StatusCode = 200,
                 Type = "Setting"
-            };
+            });
         }
         catch (Exception ex)
         {
             Logger.Error(ex);
             HttpContext.Response.StatusCode = 500;
-            return new ApiResponse
+            return Task.FromResult(new ApiResponse
             {
                 Success = false,
                 Error = ex.Message,
                 StatusCode = 500,
                 Type = "Error"
-            };
+            });
         }
     }
 
@@ -230,78 +228,70 @@ public class SettingsController : WebApiController
     /// DELETE /api/settings/{key} - Delete a setting
     /// </summary>
     [Route(HttpVerbs.Delete, "/settings/{key}")]
-    public async Task<ApiResponse> DeleteSetting(string key)
+    public Task<ApiResponse> DeleteSetting(string key)
     {
         try
         {
             if (string.IsNullOrEmpty(key))
             {
                 HttpContext.Response.StatusCode = 400;
-                return new ApiResponse
+                return Task.FromResult(new ApiResponse
                 {
                     Success = false,
                     Error = "Key ist erforderlich",
                     StatusCode = 400,
                     Type = "Error"
-                };
+                });
             }
-
-            if (!File.Exists(SettingsFilePath))
-            {
-                return new ApiResponse
-                {
-                    Success = false,
-                    Error = "Keine Einstellungen vorhanden",
-                    StatusCode = 404,
-                    Type = "NotFound"
-                };
-            }
-
-            var json = await File.ReadAllTextAsync(SettingsFilePath);
-            var settings = JsonSerializer.Deserialize<Dictionary<string, string>>(json, new JsonSerializerOptions { AllowTrailingCommas = true }) ?? new();
-
-            if (!settings.ContainsKey(key))
-            {
-                return new ApiResponse
-                {
-                    Success = false,
-                    Error = "Einstellung nicht gefunden",
-                    StatusCode = 404,
-                    Type = "NotFound"
-                };
-            }
-
-            settings.Remove(key);
 
             lock (_fileLock)
             {
-                var updatedJson = System.Text.Json.JsonSerializer.Serialize(
-                    settings,
-                    new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+                var settings = LoadLocked();
 
-                File.WriteAllText(SettingsFilePath, updatedJson);
-                _fileCache = null;
+                if (!File.Exists(SettingsFilePath))
+                {
+                    return Task.FromResult(new ApiResponse
+                    {
+                        Success = false,
+                        Error = "Keine Einstellungen vorhanden",
+                        StatusCode = 404,
+                        Type = "NotFound"
+                    });
+                }
+
+                if (!settings.Remove(key))
+                {
+                    return Task.FromResult(new ApiResponse
+                    {
+                        Success = false,
+                        Error = "Einstellung nicht gefunden",
+                        StatusCode = 404,
+                        Type = "NotFound"
+                    });
+                }
+
+                SaveLocked(settings);
             }
 
-            return new ApiResponse
+            return Task.FromResult(new ApiResponse
             {
                 Success = true,
                 Response = $"Einstellung '{key}' gelöscht",
                 StatusCode = 200,
                 Type = "Setting"
-            };
+            });
         }
         catch (Exception ex)
         {
             Logger.Error(ex);
             HttpContext.Response.StatusCode = 500;
-            return new ApiResponse
+            return Task.FromResult(new ApiResponse
             {
                 Success = false,
                 Error = ex.Message,
                 StatusCode = 500,
                 Type = "Error"
-            };
+            });
         }
     }
 
@@ -327,47 +317,40 @@ public class SettingsController : WebApiController
 
             var updatedSetting = await HttpContext.GetRequestDataAsync<Setting>();
 
-            if (!File.Exists(SettingsFilePath))
-            {
-                return new ApiResponse
-                {
-                    Success = false,
-                    Error = "Keine Einstellungen vorhanden",
-                    StatusCode = 404,
-                    Type = "NotFound"
-                };
-            }
-
-            var json = await File.ReadAllTextAsync(SettingsFilePath);
-            var settings = JsonSerializer.Deserialize<Dictionary<string, string>>(json, new JsonSerializerOptions { AllowTrailingCommas = true }) ?? new();
-
-            if (!settings.ContainsKey(key))
-            {
-                return new ApiResponse
-                {
-                    Success = false,
-                    Error = "Einstellung nicht gefunden",
-                    StatusCode = 404,
-                    Type = "NotFound"
-                };
-            }
-
-            settings[key] = updatedSetting.Value;
-
             lock (_fileLock)
             {
-                var updatedJson = System.Text.Json.JsonSerializer.Serialize(
-                    settings,
-                    new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+                var settings = LoadLocked();
 
-                File.WriteAllText(SettingsFilePath, updatedJson);
-                _fileCache = null;
+                if (!File.Exists(SettingsFilePath))
+                {
+                    return new ApiResponse
+                    {
+                        Success = false,
+                        Error = "Keine Einstellungen vorhanden",
+                        StatusCode = 404,
+                        Type = "NotFound"
+                    };
+                }
+
+                if (!settings.ContainsKey(key))
+                {
+                    return new ApiResponse
+                    {
+                        Success = false,
+                        Error = "Einstellung nicht gefunden",
+                        StatusCode = 404,
+                        Type = "NotFound"
+                    };
+                }
+
+                settings[key] = updatedSetting.Value;
+                SaveLocked(settings);
             }
 
             return new ApiResponse
             {
                 Success = true,
-                Response = new Setting { Key = key, Value = settings[key] },
+                Response = new Setting { Key = key, Value = updatedSetting.Value },
                 StatusCode = 200,
                 Type = "Setting"
             };
