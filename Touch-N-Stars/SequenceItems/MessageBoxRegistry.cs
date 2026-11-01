@@ -17,22 +17,25 @@ namespace TouchNStars.SequenceItems {
             public string Text { get; set; }
             public DateTime CreatedAt { get; set; }
             public IWindowService WindowService { get; set; }
-            public Action CloseAction { get; set; }
-            public bool ContinueOnClose { get; set; } = true;
+
+            /// <summary>
+            /// Closes the box; the argument is whether the sequence continues. The box takes the
+            /// choice with the close itself, since the registration is gone once Close returns.
+            /// </summary>
+            public Action<bool> CloseAction { get; set; }
         }
 
         /// <summary>
         /// Register a new message box
         /// </summary>
-        public static Guid Register(string text, IWindowService windowService, Action closeAction) {
+        public static Guid Register(string text, IWindowService windowService, Action<bool> closeAction) {
             var id = Guid.NewGuid();
             var registration = new MessageBoxRegistration {
                 Id = id,
                 Text = text,
                 CreatedAt = DateTime.Now,
                 WindowService = windowService,
-                CloseAction = closeAction,
-                ContinueOnClose = true
+                CloseAction = closeAction
             };
 
             activeMessageBoxes.TryAdd(id, registration);
@@ -51,8 +54,7 @@ namespace TouchNStars.SequenceItems {
         /// </summary>
         public static bool Close(Guid id, bool continueSequence = true) {
             if (activeMessageBoxes.TryGetValue(id, out var registration)) {
-                registration.ContinueOnClose = continueSequence;
-                registration.CloseAction?.Invoke();
+                registration.CloseAction?.Invoke(continueSequence);
                 Unregister(id);
                 return true;
             }

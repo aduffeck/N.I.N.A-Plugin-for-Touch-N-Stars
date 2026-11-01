@@ -123,21 +123,41 @@ namespace TouchNStars.SequenceItems {
         public override async Task Execute(IProgress<ApplicationStatus> progress, CancellationToken token) {
             var service = windowServiceFactory.Create();
             var msgBoxResult = new TNSMessageBoxResult(Text);
-            currentMessageBoxId = Guid.NewGuid();
 
-            bool closedByApi = false;
-            bool closedByTimeout = false;
+            // Whoever closes the box first decides whether the sequence goes on: the dialog's own
+            // buttons, the app through the API, or the timeout. A later close doesn't change it.
+            var decisionLock = new object();
+            string closedBy = null;
+            bool continueSequence = true;
+
+            bool Decide(string by, bool goOn) {
+                lock (decisionLock) {
+                    if (closedBy != null) {
+                        return false;
+                    }
+
+                    closedBy = by;
+                    continueSequence = goOn;
+                    return true;
+                }
+            }
+
+            // Ends the timeout once the box is closed, so it neither fires late nor holds up Execute
+            using var dialogClosed = CancellationTokenSource.CreateLinkedTokenSource(token);
 
             try {
-                // Set the close action so buttons can close the window
-                msgBoxResult.SetCloseAction(() => service?.Close());
+                // The buttons set msgBoxResult.Continue before they close the window
+                msgBoxResult.SetCloseAction(() => {
+                    Decide("dialog", msgBoxResult.Continue);
+                    service?.Close();
+                });
 
                 // Register this message box in the global registry
                 var registrationId = MessageBoxRegistry.Register(
                     Text,
                     service,
-                    () => {
-                        closedByApi = true;
+                    goOn => {
+                        Decide("API", goOn);
                         service?.Close();
                     }
                 );
@@ -153,14 +173,12 @@ namespace TouchNStars.SequenceItems {
                     Logger.Info($"TNS MessageBox - Starting timeout task for {TimeoutSeconds} seconds");
                     timeoutTask = Task.Run(async () => {
                         try {
-                            await Task.Delay(TimeSpan.FromSeconds(TimeoutSeconds), token);
-                            if (!token.IsCancellationRequested) {
-                                closedByTimeout = true;
-                                msgBoxResult.Continue = ContinueOnTimeout;
+                            await Task.Delay(TimeSpan.FromSeconds(TimeoutSeconds), dialogClosed.Token);
+                            if (Decide("timeout", ContinueOnTimeout)) {
                                 Logger.Info($"TNS MessageBox - Timeout triggered after {TimeoutSeconds} seconds, Continue: {ContinueOnTimeout}");
                                 service?.Close();
                             }
-                        } catch (TaskCanceledException) {
+                        } catch (OperationCanceledException) {
                             Logger.Info($"TNS MessageBox - Timeout task cancelled");
                         }
                     });
@@ -176,24 +194,14 @@ namespace TouchNStars.SequenceItems {
                     Logger.Info($"TNS MessageBox - Dialog closed");
                 }
 
-                // Wait for timeout task to complete if it's running
-                if (timeoutTask != null && !timeoutTask.IsCompleted) {
+                dialogClosed.Cancel();
+                if (timeoutTask != null) {
                     try {
                         await timeoutTask;
                     } catch (Exception ex) {
                         Logger.Debug($"TNS MessageBox - Timeout task exception: {ex.Message}");
                     }
                 }
-
-                // Check if closed by API
-                if (closedByApi) {
-                    var registration = MessageBoxRegistry.Get(registrationId);
-                    if (registration != null) {
-                        msgBoxResult.Continue = registration.ContinueOnClose;
-                        Logger.Info($"TNS MessageBox closed by API - Continue: {msgBoxResult.Continue}");
-                    }
-                }
-
             } finally {
                 // Always unregister when done
                 if (currentMessageBoxId.HasValue) {
@@ -204,22 +212,19 @@ namespace TouchNStars.SequenceItems {
 
             token.ThrowIfCancellationRequested();
 
-            // Handle the result
-            if (!msgBoxResult.Continue && !closedByTimeout) {
-                Logger.Info("TNS MessageBox: User cancelled - Stopping Sequence");
+            string by;
+            bool goOnWithSequence;
+            lock (decisionLock) {
+                // Closed without a decision (e.g. the window went away): as before, the sequence continues
+                by = closedBy ?? "dialog";
+                goOnWithSequence = closedBy != null ? continueSequence : msgBoxResult.Continue;
+            }
+
+            Logger.Info($"TNS MessageBox closed by {by} - Continue: {goOnWithSequence}");
+            if (!goOnWithSequence) {
+                Logger.Info($"TNS MessageBox: Stopping Sequence ({by})");
                 var root = ItemUtility.GetRootContainer(this.Parent);
                 root?.Interrupt();
-            } else if (closedByTimeout && !ContinueOnTimeout) {
-                Logger.Info("TNS MessageBox: Timeout - Stopping Sequence");
-                var root = ItemUtility.GetRootContainer(this.Parent);
-                root?.Interrupt();
-            } else if (closedByApi) {
-                var registration = MessageBoxRegistry.Get(currentMessageBoxId ?? Guid.Empty);
-                if (registration != null && !registration.ContinueOnClose) {
-                    Logger.Info("TNS MessageBox: API closed with stop - Stopping Sequence");
-                    var root = ItemUtility.GetRootContainer(this.Parent);
-                    root?.Interrupt();
-                }
             }
         }
 
