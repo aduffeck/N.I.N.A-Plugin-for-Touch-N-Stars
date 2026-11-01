@@ -34,7 +34,7 @@ namespace TouchNStars.Server.Controllers;
 ///   POST /api/filter-offset/apply   → write the chosen offsets to the profile
 ///   GET  /api/filter-offset/discard → restore old values and go back to Idle
 /// </summary>
-public class FilterOffsetController : WebApiController
+public partial class FilterOffsetController : WebApiController
 {
     // ── Shared state ─────────────────────────────────────────────────────────
     // All of this is static and reachable from every HTTP entry point at once (several browser tabs,
@@ -383,6 +383,13 @@ public class FilterOffsetController : WebApiController
                     return new ApiResponse { Success = false, Error = "No result pending", StatusCode = 409, Type = "Error" };
                 }
 
+                if (_result.BaseFilterUnmeasured)
+                {
+                    // every offset of such a result is 0: applying it would make all filters parfocal
+                    HttpContext.Response.StatusCode = 409;
+                    return new ApiResponse { Success = false, Error = "The base filter has no usable measurement, so the result can't be applied. Discard it and run the calibration again.", StatusCode = 409, Type = "Error" };
+                }
+
                 var profile = TouchNStars.Mediators?.Profile?.ActiveProfile;
                 if (profile == null)
                 {
@@ -527,8 +534,10 @@ public class FilterOffsetController : WebApiController
     {
         var profile = TouchNStars.Mediators.Profile.ActiveProfile;
 
-        // 1. Save old state
+        // 1. Save old state. The flag also goes to a file: the profile is saved about a second after it is switched
+        // off below, so a restart of pins mid-run would otherwise keep it off for good (RecoverInterruptedRun)
         _oldUseOffsets = profile.FocuserSettings.UseFilterWheelOffsets;
+        WriteRunSnapshot(profile.Id, _oldUseOffsets);
         _oldDefaultFilterPosition = profile.FilterWheelSettings.FilterWheelFilters.FirstOrDefault(f => f.AutoFocusFilter)?.Position;
         _oldOffsets = selectedFilters
             .Select(f => ((int)f.Position, f.Name, f.FocusOffset))
@@ -647,9 +656,18 @@ public class FilterOffsetController : WebApiController
             }
         }
 
+        // The measuring is done: offsets apply on filter changes again from here, whether or not anyone ever
+        // accepts or discards the result (an apply sets the flag anyway)
+        RestoreUseOffsets();
+
         // 4. Compute new offsets using the same algorithm as FilterOffsetCalculator.Execute()
         var newOffsets = ComputeOffsets(selectedFilters, calculatedPositions, profile,
             out var details, out var temperatureDrift, out var baseFilterUnmeasured);
+
+        // A filter without a usable measurement keeps its previous distance to the base filter (the first selected
+        // one): stated as 0 it would be written as parfocal with the base, e.g. Ha after it failed in the clouds
+        var unmeasured = details.Where(d => d.EstimatedFocus == null).Select(d => d.Position).ToHashSet();
+        int basePreviousOffset = _oldOffsets.Count > 0 ? _oldOffsets[0].FocusOffset : 0;
 
         // 5. Store result and move to PendingResult state. This is the only transition INTO the state
         // the HTTP handlers wait on, so it publishes under the same lock they read under — otherwise
@@ -667,7 +685,15 @@ public class FilterOffsetController : WebApiController
                     .Select(o => new FilterOffsetEntry { Position = o.Position, Name = o.Name, FocusOffset = o.FocusOffset })
                     .ToList(),
                 NewOffsets = newOffsets
-                    .Select(o => new FilterOffsetEntry { Position = o.Position, Name = o.Name, FocusOffset = o.FocusOffset })
+                    .Select(o => unmeasured.Contains(o.Position) && !baseFilterUnmeasured
+                        ? new FilterOffsetEntry
+                        {
+                            Position = o.Position,
+                            Name = o.Name,
+                            FocusOffset = (_oldOffsets.FirstOrDefault(x => x.Position == o.Position).FocusOffset) - basePreviousOffset,
+                            Measured = false,
+                        }
+                        : new FilterOffsetEntry { Position = o.Position, Name = o.Name, FocusOffset = o.FocusOffset, Measured = !unmeasured.Contains(o.Position) })
                     .ToList(),
                 OldDefaultFilterPosition = _oldDefaultFilterPosition.HasValue ? (int?)_oldDefaultFilterPosition.Value : null,
                 SuggestedDefaultFilterPosition = _oldDefaultFilterPosition.HasValue ? (int?)_oldDefaultFilterPosition.Value : null,
@@ -1322,8 +1348,9 @@ public class FilterOffsetController : WebApiController
         var table = new List<(int Position, string Name, int FocusOffset)>();
         if (profileFilters == null || measuredOffsets == null || measuredOffsets.Count == 0) return table;
 
+        // a filter of the run without a usable measurement is carried across like one that was not calibrated
         var measured = new Dictionary<int, int>();
-        foreach (var o in measuredOffsets) measured[o.Position] = o.FocusOffset;
+        foreach (var o in measuredOffsets.Where(o => o.Measured)) measured[o.Position] = o.FocusOffset;
 
         int basePosition = measuredOffsets[0].Position;
         int baseMeasured = measuredOffsets[0].FocusOffset;
@@ -1377,7 +1404,7 @@ public class FilterOffsetController : WebApiController
             var profile = TouchNStars.Mediators?.Profile?.ActiveProfile;
             if (profile == null) return;
 
-            profile.FocuserSettings.UseFilterWheelOffsets = _oldUseOffsets;
+            RestoreUseOffsets();
 
             foreach (var (Position, Name, FocusOffset) in _oldOffsets)
             {
@@ -1391,6 +1418,103 @@ public class FilterOffsetController : WebApiController
         catch (Exception ex)
         {
             Logger.Error($"FilterOffset: failed to restore old values: {ex.Message}");
+        }
+    }
+}
+
+// ── Run snapshot: UseFilterWheelOffsets across a restart ────────────────────────
+
+public partial class FilterOffsetController
+{
+    private sealed class RunSnapshot
+    {
+        public Guid ProfileId { get; set; }
+        public bool UseFilterWheelOffsets { get; set; }
+    }
+
+    private static readonly string RunSnapshotPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "NINA", "TnsCache", "filter-offset-run.json");
+
+    private static void WriteRunSnapshot(Guid profileId, bool useFilterWheelOffsets)
+    {
+        try
+        {
+            JsonFileStore.Write(RunSnapshotPath, JsonSerializer.Serialize(new RunSnapshot
+            {
+                ProfileId = profileId,
+                UseFilterWheelOffsets = useFilterWheelOffsets,
+            }));
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"FilterOffset: could not save the offsets setting for after a restart: {ex.Message}");
+        }
+    }
+
+    private static void DeleteRunSnapshot()
+    {
+        try
+        {
+            File.Delete(RunSnapshotPath);
+            File.Delete(JsonFileStore.BackupPath(RunSnapshotPath));
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"FilterOffset: could not delete {RunSnapshotPath}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Puts UseFilterWheelOffsets back the way the run found it, once the measuring is over (done, failed or
+    /// cancelled). Only the measuring needs the offsets off; left off until an accept or a discard that may never
+    /// come, the sequences of every following night ran without them.
+    /// </summary>
+    private static void RestoreUseOffsets()
+    {
+        var profile = TouchNStars.Mediators?.Profile?.ActiveProfile;
+        if (profile != null)
+        {
+            profile.FocuserSettings.UseFilterWheelOffsets = _oldUseOffsets;
+        }
+
+        DeleteRunSnapshot();
+    }
+
+    /// <summary>
+    /// At plugin start: a calibration that pins stopped in the middle of (restart, power cut) left the offsets
+    /// switched off in the profile. Puts the setting back for that profile and drops the snapshot.
+    /// </summary>
+    internal static void RecoverInterruptedRun()
+    {
+        try
+        {
+            if (!File.Exists(RunSnapshotPath) && !File.Exists(JsonFileStore.BackupPath(RunSnapshotPath)))
+            {
+                return;
+            }
+
+            var snapshot = JsonFileStore.Read<RunSnapshot>(
+                RunSnapshotPath,
+                json => JsonSerializer.Deserialize<RunSnapshot>(json),
+                () => null,
+                "filter offset run snapshot");
+            var profile = TouchNStars.Mediators?.Profile?.ActiveProfile;
+            if (snapshot != null && profile != null && profile.Id == snapshot.ProfileId)
+            {
+                Logger.Warning($"FilterOffset: a filter offset calibration was interrupted; filter offsets are switched {(snapshot.UseFilterWheelOffsets ? "on" : "off")} again as before it");
+                profile.FocuserSettings.UseFilterWheelOffsets = snapshot.UseFilterWheelOffsets;
+            }
+            else if (snapshot != null)
+            {
+                Logger.Warning("FilterOffset: a filter offset calibration of another profile was interrupted; check \"Use filter offsets\" in that profile");
+            }
+
+            DeleteRunSnapshot();
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"FilterOffset: could not recover an interrupted calibration: {ex.Message}");
         }
     }
 }
@@ -1417,6 +1541,12 @@ public class FilterOffsetEntry
     public int Position { get; set; }
     public string Name { get; set; }
     public int FocusOffset { get; set; }
+
+    /// <summary>
+    /// False for a filter of the run that produced no usable measurement. Its <see cref="FocusOffset"/> is then its
+    /// previous distance to the base filter, which an apply keeps, instead of 0.
+    /// </summary>
+    public bool Measured { get; set; } = true;
 }
 
 /// <summary>

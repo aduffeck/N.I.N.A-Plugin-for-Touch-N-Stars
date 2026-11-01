@@ -112,6 +112,7 @@ namespace TouchNStars.Server {
                     BackgroundWorker.MonitorLastAF();
                     AutofocusWatcher.Start();
                     FlatTargetNameService.Start();
+                    FilterOffsetController.RecoverInterruptedRun();
                 }
             } catch (Exception ex) {
                 Logger.Error($"failed to start web server: {ex}");
