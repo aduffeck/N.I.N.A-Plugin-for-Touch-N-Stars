@@ -90,6 +90,12 @@ public class TilterService
         public double ImagePlaneTopRightAbsolute { get; set; }
         public double ImagePlaneBottomLeftAbsolute { get; set; }
         public double ImagePlaneBottomRightAbsolute { get; set; }
+
+        /// <summary>
+        /// Why the device's state could not be read; null when it was. The positions and IsMoving are then not the
+        /// device's (0 and false) and must not be used as a baseline or a motion check.
+        /// </summary>
+        public string Error { get; set; }
     }
 
     public class SensorConfigurationDTO
@@ -338,6 +344,7 @@ public class TilterService
             if (result != WandererSDK.WTErrorType.Success)
             {
                 Logger.Error($"TilterService: Failed to get status for device {deviceId}: {result}");
+                status.Error = $"The tilter's state could not be read ({result})";
                 return status;
             }
 
@@ -356,6 +363,7 @@ public class TilterService
         catch (Exception ex)
         {
             Logger.Error($"TilterService: Error getting status for device {deviceId}: {ex.Message}");
+            status.Error = $"The tilter's state could not be read ({ex.Message})";
         }
 
         return status;

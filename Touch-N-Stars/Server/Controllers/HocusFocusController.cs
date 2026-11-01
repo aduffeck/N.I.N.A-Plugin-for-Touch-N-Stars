@@ -3779,15 +3779,31 @@ public class HocusFocusController : WebApiController
 
             // A new target while the actuators are still travelling would be taken mid-move. Refused
             // here rather than only in the app, so a second client cannot slip one in either.
-            if (deviceId != -1 && tilterService.IsDeviceConnected(deviceId) && tilterService.GetDeviceStatus(deviceId).IsMoving)
+            if (deviceId != -1 && tilterService.IsDeviceConnected(deviceId))
             {
-                HttpContext.Response.StatusCode = 409;
-                return new Dictionary<string, object>()
+                var current = tilterService.GetDeviceStatus(deviceId);
+                if (current.Error != null)
                 {
-                    { "Success", false },
-                    { "Error", "The tilter is still moving" },
-                    { "ErrorCode", "moving" }
-                };
+                    // without the state the motion check can't be made (an unread state reads as not moving)
+                    HttpContext.Response.StatusCode = 503;
+                    return new Dictionary<string, object>()
+                    {
+                        { "Success", false },
+                        { "Error", current.Error },
+                        { "ErrorCode", "status-unavailable" }
+                    };
+                }
+
+                if (current.IsMoving)
+                {
+                    HttpContext.Response.StatusCode = 409;
+                    return new Dictionary<string, object>()
+                    {
+                        { "Success", false },
+                        { "Error", "The tilter is still moving" },
+                        { "ErrorCode", "moving" }
+                    };
+                }
             }
 
             bool success = tilterService.SetDevicePositions(deviceId, position1, position2, position3);
@@ -4080,21 +4096,25 @@ public class HocusFocusController : WebApiController
                 double currentP1 = 0, currentP2 = 0, currentP3 = 0;
                 if (deviceId != -1)
                 {
-                    try
+                    // The correction is relative to these positions: computed from 0/0/0 after a read error, the
+                    // targets would drive the tilter into a wrong tilt
+                    var status = tilterService.GetDeviceStatus(deviceId, finalOuterRadius);
+                    if (status.Error != null)
                     {
-                        var status = tilterService.GetDeviceStatus(deviceId, finalOuterRadius);
-                        if (status != null)
+                        Logger.Warning($"[ApplyTiltPlane] Could not read the current positions, not calculating: {status.Error}");
+                        HttpContext.Response.StatusCode = 503;
+                        return new Dictionary<string, object>()
                         {
-                            currentP1 = status.CurrentPosition1;
-                            currentP2 = status.CurrentPosition2;
-                            currentP3 = status.CurrentPosition3;
-                            Logger.Info($"[ApplyTiltPlane] Current device positions (mm) - P1: {currentP1:F6}, P2: {currentP2:F6}, P3: {currentP3:F6}");
-                        }
+                            { "Success", false },
+                            { "Error", $"{status.Error}. The correction is relative to the current positions; try again." },
+                            { "ErrorCode", "status-unavailable" }
+                        };
                     }
-                    catch (Exception ex)
-                    {
-                        Logger.Warning($"[ApplyTiltPlane] Could not retrieve current positions, using 0: {ex.Message}");
-                    }
+
+                    currentP1 = status.CurrentPosition1;
+                    currentP2 = status.CurrentPosition2;
+                    currentP3 = status.CurrentPosition3;
+                    Logger.Info($"[ApplyTiltPlane] Current device positions (mm) - P1: {currentP1:F6}, P2: {currentP2:F6}, P3: {currentP3:F6}");
                 }
 
                 var desiredPlane = new TilterService.ApplyTiltPlaneDTO
