@@ -35,6 +35,7 @@ public class AutofocusController : WebApiController
         }
         if (start)
         {
+            bool wasRunning = DataContainer.afRun;
             DataContainer.afRun = true;
             DataContainer.newAfGraph = false;
             DataContainer.afError = false;
@@ -54,16 +55,19 @@ public class AutofocusController : WebApiController
                     }
                     else
                     {
+                        AutofocusNotStarted(wasRunning);
                         return new Dictionary<string, object>() { { "message", $"Fehler beim Starten des Autofokus: {apiResponse.Error}" } };
                     }
                 }
                 else
                 {
+                    AutofocusNotStarted(wasRunning);
                     return new Dictionary<string, object>() { { "message", $"Fehler beim Starten des Autofokus: {response.StatusCode}" } };
                 }
             }
             catch (Exception ex)
             {
+                AutofocusNotStarted(wasRunning);
                 Logger.Error(ex);
                 HttpContext.Response.StatusCode = 500;
                 return new Dictionary<string, object>() { { "error", "Interner Fehler beim Starten des Autofokus" } };
@@ -106,5 +110,16 @@ public class AutofocusController : WebApiController
         }
 
         return new Dictionary<string, object>() { { "error", "Ungültige Anfrage" } };
+    }
+
+    // afRun is set before the start: a refused start (no focuser, ninaAPI not reachable) left it set, and the app showed
+    // an autofocus that wasn't running. It goes back to what it was, as ninaAPI also refuses a start while its autofocus
+    // still runs
+    private static void AutofocusNotStarted(bool wasRunning)
+    {
+        lock (DataContainer.lockObj)
+        {
+            DataContainer.afRun = wasRunning;
+        }
     }
 }
