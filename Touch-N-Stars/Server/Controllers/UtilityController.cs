@@ -9,6 +9,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 using TouchNStars.Utility;
 
@@ -32,43 +33,9 @@ public class UtilityController : WebApiController
         {
             string currentLogFile = Directory.GetFiles(CoreUtility.LogPath).OrderByDescending(File.GetCreationTime).First();
 
-            string[] logLines = [];
-
-            using (var stream = new FileStream(currentLogFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            {
-                using (var reader = new StreamReader(stream))
-                {
-                    string content = reader.ReadToEnd();
-                    logLines = content.Split('\n');
-                }
-            }
-
-            List<string> filteredLogLines = new List<string>();
-            foreach (string line in logLines)
-            {
-                bool valid = true;
-
-                if (!line.Contains('|' + level + '|') && !string.IsNullOrEmpty(level))
-                {
-                    valid = false;
-                }
-                if (line.Contains("DATE|LEVEL|SOURCE|MEMBER|LINE|MESSAGE"))
-                {
-                    valid = false;
-                }
-                foreach (string excluded_member in excluded_members)
-                {
-                    if (line.Contains(excluded_member))
-                    {
-                        valid = false;
-                    }
-                }
-                if (valid)
-                {
-                    filteredLogLines.Add(line);
-                }
-            }
-            IEnumerable<string> lines = filteredLogLines.TakeLast(count);
+            // the app asks for the last 50 lines every second: reading the whole log for them (megabytes by the end of a
+            // night) kept the Pi's CPU and GC busy all the time. Only the end of the log is read now
+            List<string> lines = LastShownLines(currentLogFile, count, line => IsShown(line, level));
             foreach (string line in lines)
             {
                 string[] parts = line.Split('|');
@@ -87,6 +54,89 @@ public class UtilityController : WebApiController
         }
         logs.Reverse();
         return logs;
+    }
+
+    private static bool IsShown(string line, string level)
+    {
+        if (!string.IsNullOrEmpty(level) && !line.Contains('|' + level + '|'))
+        {
+            return false;
+        }
+
+        if (line.Contains("DATE|LEVEL|SOURCE|MEMBER|LINE|MESSAGE"))
+        {
+            return false;
+        }
+
+        return !excluded_members.Any(line.Contains);
+    }
+
+    private const int LogBlockSize = 64 * 1024;
+
+    /// <summary>
+    /// The last <paramref name="count"/> lines of the file that are shown, oldest first: the lines split on '\n' as the
+    /// whole file split would give them (the empty one after the last newline included). The file is read backwards in
+    /// blocks until enough lines are found. Lines are split on the '\n' byte, which is never part of a UTF-8 character,
+    /// and decoded one by one.
+    /// </summary>
+    private static List<string> LastShownLines(string path, int count, Func<string, bool> shown)
+    {
+        var found = new List<string>();
+        if (count <= 0)
+        {
+            return found;
+        }
+
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        long position = stream.Length;
+        byte[] rest = [];
+        while (true)
+        {
+            int size = (int)Math.Min(LogBlockSize, position);
+            position -= size;
+            var block = new byte[size + rest.Length];
+            stream.Position = position;
+            stream.ReadExactly(block, 0, size);
+            rest.CopyTo(block, size);
+
+            int lineEnd = block.Length;
+            for (int i = block.Length - 1; i >= 0; i--)
+            {
+                if (block[i] == (byte)'\n')
+                {
+                    if (TakeLine(block, i + 1, lineEnd, shown, found, count))
+                    {
+                        found.Reverse();
+                        return found;
+                    }
+
+                    lineEnd = i;
+                }
+            }
+
+            if (position == 0)
+            {
+                // the first line, without the BOM StreamReader left out
+                int start = lineEnd >= 3 && block[0] == 0xEF && block[1] == 0xBB && block[2] == 0xBF ? 3 : 0;
+                TakeLine(block, start, lineEnd, shown, found, count);
+                found.Reverse();
+                return found;
+            }
+
+            rest = block[..lineEnd];
+        }
+    }
+
+    // adds the line if it is shown; true once enough lines are found
+    private static bool TakeLine(byte[] bytes, int start, int end, Func<string, bool> shown, List<string> found, int count)
+    {
+        string line = Encoding.UTF8.GetString(bytes, start, end - start);
+        if (shown(line))
+        {
+            found.Add(line);
+        }
+
+        return found.Count >= count;
     }
 
     [Route(HttpVerbs.Get, "/loglevel")]
