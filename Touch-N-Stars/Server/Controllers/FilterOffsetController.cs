@@ -1481,12 +1481,21 @@ public partial class FilterOffsetController
         DeleteRunSnapshot();
     }
 
+    // Only an earlier pins process can have left the snapshot. The server starts again in this one when the app is
+    // switched off and on, possibly while a calibration runs, whose snapshot has to stay.
+    private static int _recoveryDone;
+
     /// <summary>
     /// At plugin start: a calibration that pins stopped in the middle of (restart, power cut) left the offsets
-    /// switched off in the profile. Puts the setting back for that profile and drops the snapshot.
+    /// switched off in the profile. Puts the setting back for that profile and drops the snapshot; once per process.
     /// </summary>
     internal static void RecoverInterruptedRun()
     {
+        if (Interlocked.Exchange(ref _recoveryDone, 1) != 0)
+        {
+            return;
+        }
+
         try
         {
             if (!File.Exists(RunSnapshotPath) && !File.Exists(JsonFileStore.BackupPath(RunSnapshotPath)))
@@ -1507,7 +1516,9 @@ public partial class FilterOffsetController
             }
             else if (snapshot != null)
             {
-                Logger.Warning("FilterOffset: a filter offset calibration of another profile was interrupted; check \"Use filter offsets\" in that profile");
+                // kept, so a start of pins with that profile puts its setting back
+                Logger.Warning("FilterOffset: a filter offset calibration of another profile was interrupted; \"Use filter offsets\" is switched back when pins starts with that profile");
+                return;
             }
 
             DeleteRunSnapshot();
