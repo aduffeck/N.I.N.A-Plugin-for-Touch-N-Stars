@@ -190,7 +190,25 @@ namespace TouchNStars.SequenceItems {
                     service?.Close();
                 })) {
                     Logger.Info($"TNS MessageBox - Showing dialog");
-                    await service.ShowDialog(msgBoxResult, "Touch 'N' Stars Message");
+                    var dialog = service.ShowDialog(msgBoxResult, "Touch 'N' Stars Message").Task;
+
+                    // A close that came before the dialog was open (the API right after the registration, a short
+                    // timeout, a cancellation) found nothing to close: the dialog stayed open, and /messagebox no
+                    // longer listed it. Close it again until it is closed.
+                    while (!dialog.IsCompleted) {
+                        bool decided;
+                        lock (decisionLock) {
+                            decided = closedBy != null;
+                        }
+
+                        if (decided || token.IsCancellationRequested) {
+                            _ = service?.Close();
+                        }
+
+                        await Task.WhenAny(dialog, Task.Delay(200));
+                    }
+
+                    await dialog;
                     Logger.Info($"TNS MessageBox - Dialog closed");
                 }
 
