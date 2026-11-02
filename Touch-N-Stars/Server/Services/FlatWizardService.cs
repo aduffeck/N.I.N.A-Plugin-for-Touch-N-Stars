@@ -174,6 +174,7 @@ public static class FlatWizardService
 
             var token = runCts.Token;
             var keepClosed = request.KeepClosed;
+            WatchSequenceStart(true);
             _ = Task.Run(() => RunAsync(keepClosed, token));
         }
 
@@ -228,6 +229,27 @@ public static class FlatWizardService
     // Caller holds `gate`.
     private static bool IsCurrentRun(string forRunId) => string.IsNullOrEmpty(forRunId) || forRunId == runId;
 
+    /// <summary>
+    /// The body of GET /api/flats/status. Workflow 2 (since the server-side run), which a client checks before it
+    /// reads the fields below; before, there was no Workflow field, the run was driven by the app and its state was
+    /// "Finished" before the first run, progress counted over the whole run and CompletedFilters counted filters.
+    /// <list type="bullet">
+    /// <item>State: "Idle" before the first run since the plugin started, "Running", "Finished" after a run (its
+    /// result stays until the next one starts).</item>
+    /// <item>Phase: "idle", "flats", "waiting-for-cover" (dark flats wait for GET /api/flats/confirm-cover, at most
+    /// 30 minutes), "darks", "done". Type is "darks" while waiting for the cover and during the dark flats, otherwise
+    /// "flats".</item>
+    /// <item>TotalIterations, CompletedIterations: frames of the current filter in the current phase (written to
+    /// disk, not loop iterations); between filters and after the run, the flats of all filters.</item>
+    /// <item>TotalFilters: filters of the current phase (for the darks only those that get dark flats).
+    /// CompletedFilters: the position of the current filter among them (0-based), -1 when no filter runs.</item>
+    /// <item>CurrentFilterId, Filters[].FilterId: the filter's index in the profile, null for "no filter change".</item>
+    /// <item>Filters[].State: "pending", "running", "success", "failed", "dim", "bright", "stopped".
+    /// Filters[].DarkState: "none" (no dark flats), "pending", "running", "success", "failed", "skipped" (its flats
+    /// didn't succeed), "stopped".</item>
+    /// <item>Error: why the run ended early (an exception, or "Stopped because a sequence started"), else null.</item>
+    /// </list>
+    /// </summary>
     public static object GetStatus()
     {
         lock (gate)
@@ -397,9 +419,60 @@ public static class FlatWizardService
                 phase = "done";
                 running = false;
                 finishedAt = DateTime.UtcNow;
+
+                // A run that wasn't stopped waited for every frame's save (WaitForSaves), so none of its flats
+                // is left to name. Kept for the hook grace period otherwise, for frames still in NINA's queue;
+                // until then flats from elsewhere without a name got this run's name too.
+                if (!stopRequested && runError == null) targetName = null;
             }
 
+            WatchSequenceStart(false);
             progress.Clear();
+        }
+    }
+
+    // Lets a flat run end before a sequence starts. Starting one is refused while a sequence runs, but a sequence
+    // can start during a run from anywhere (ninaAPI, which the app uses, another device, NINA's start button, an
+    // autostart), and its lights would be taken under the lit panel or with the run's filter switching in between.
+    private static readonly TimeSpan SequenceStartStopTimeout = TimeSpan.FromSeconds(60);
+
+    private static void WatchSequenceStart(bool watch)
+    {
+        try
+        {
+            var sequence = TouchNStars.Mediators?.Sequence;
+            if (sequence == null) return;
+            sequence.SequenceStarting -= OnSequenceStarting;
+            if (watch) sequence.SequenceStarting += OnSequenceStarting;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"Flat run: could not {(watch ? "watch" : "stop watching")} for a sequence start: {ex.Message}");
+        }
+    }
+
+    // NINA awaits SequenceStarting before the sequence's first item, so the run is over (panel light off) by then.
+    private static async Task OnSequenceStarting(object sender, EventArgs e)
+    {
+        string currentRunId;
+        lock (gate)
+        {
+            if (!running) return;
+            currentRunId = runId;
+            runError ??= "Stopped because a sequence started";
+        }
+
+        Logger.Warning("Flat run: a sequence is starting, stopping the flat run first");
+        Stop(currentRunId);
+        var deadline = DateTime.UtcNow + SequenceStartStopTimeout;
+        while (IsRunning && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(250);
+        }
+
+        if (IsRunning)
+        {
+            Logger.Warning($"Flat run: still running {SequenceStartStopTimeout.TotalSeconds:F0} s after the stop, the sequence starts anyway");
         }
     }
 
