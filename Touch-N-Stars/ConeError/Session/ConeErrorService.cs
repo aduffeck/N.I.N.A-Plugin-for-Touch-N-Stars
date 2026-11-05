@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using NINA.Core.Utility;
+using NINA.Core.Utility.Notification;
 using TouchNStars.ConeError.Domain;
 
 namespace TouchNStars.ConeError.Session;
@@ -624,11 +625,27 @@ public sealed class ConeErrorService
             return Status();
         }
 
+        if (journal.OriginalUnknown)
+        {
+            // nothing to put back: a guessed preferred pier side could leave the mount worse off than it is
+            Store.ClearJournal();
+            throw new ConeErrorException("OriginalUnknown",
+                "The restore journal could not be read, so the mount's settings from before the session are unknown. Check the mount's preferred pier side and tracking.");
+        }
+
         IConeEnvironment env = environment();
         MountSnapshot mount = SafeSnapshot(env.Mount);
         if (mount == null || !mount.Connected)
         {
             throw new ConeErrorException("MountNotConnected", "Connect the mount to restore its settings.");
+        }
+
+        // the journal holds another mount's settings (another profile or mount connected since)
+        string key = MountKey(env.Observatory.Profile(), mount);
+        if (journal.MountName != null && journal.MountName != key)
+        {
+            throw new ConeErrorException("OtherMount",
+                $"The settings to restore belong to another mount or profile ({journal.MountName}). Connect that mount to restore them.");
         }
 
         MountDriverInfo driver = env.Driver.Inspect();
@@ -644,6 +661,25 @@ public sealed class ConeErrorService
 
         Store.ClearJournal();
         return Status();
+    }
+
+    /// <summary>
+    /// At plugin start: a session that did not end (e.g. the battery died during it) left the mount with its preferred
+    /// pier side forced, and only the cone error panel showed it. A warning tells about it at once.
+    /// </summary>
+    public void WarnAboutOpenRestore()
+    {
+        try
+        {
+            if (Store.LoadJournal() != null)
+            {
+                Notification.ShowWarning("A cone error measurement did not finish: the mount may still have its preferred pier side forced. Open Cone Error to restore its settings.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"ConeError: could not check for an open restore: {ex.Message}");
+        }
     }
 
     /// <summary>Plugin teardown: stop and restore whatever runs.</summary>

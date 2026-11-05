@@ -119,6 +119,12 @@ public sealed class RestoreJournal
 
     /// <summary>Tracking before the session; null if the session does not change it.</summary>
     public bool? Tracking { get; set; }
+
+    /// <summary>
+    /// The journal could not be read (kept as restore.json.corrupt): a session forced the mount's settings, but what they
+    /// were before is unknown.
+    /// </summary>
+    public bool OriginalUnknown { get; set; }
 }
 
 /// <summary>JSON files of the wizard, in one directory, each written under a lock.</summary>
@@ -142,6 +148,7 @@ public sealed class ConeErrorStore
     private string SettingsPath => Path.Combine(Directory, "settings.json");
     private string ResultsPath => Path.Combine(Directory, "results.json");
     private string JournalPath => Path.Combine(Directory, "restore.json");
+    private string CorruptJournalPath => Path.Combine(Directory, "restore.json.corrupt");
 
     public ConeErrorSettings LoadSettings() => (Read<ConeErrorSettings>(SettingsPath) ?? new ConeErrorSettings()).Sanitized();
 
@@ -173,7 +180,42 @@ public sealed class ConeErrorStore
             .FirstOrDefault();
     }
 
-    public RestoreJournal LoadJournal() => Read<RestoreJournal>(JournalPath);
+    /// <summary>
+    /// The restore journal, null when none is open. An unreadable journal counted as none, so a session's forced
+    /// settings were never put back: it is kept as restore.json.corrupt and stays open with its originals unknown.
+    /// </summary>
+    public RestoreJournal LoadJournal()
+    {
+        lock (fileLock)
+        {
+            if (File.Exists(JournalPath))
+            {
+                try
+                {
+                    return JsonSerializer.Deserialize<RestoreJournal>(File.ReadAllText(JournalPath), Json)
+                        ?? new RestoreJournal { OriginalUnknown = true };
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"ConeError: the restore journal cannot be read, keeping it as {CorruptJournalPath}: {ex.Message}");
+                    try
+                    {
+                        File.Move(JournalPath, CorruptJournalPath, overwrite: true);
+                    }
+                    catch (Exception moveEx)
+                    {
+                        Logger.Warning($"ConeError: could not keep the unreadable restore journal: {moveEx.Message}");
+                    }
+
+                    return new RestoreJournal { OriginalUnknown = true };
+                }
+            }
+
+            return File.Exists(CorruptJournalPath)
+                ? new RestoreJournal { OriginalUnknown = true, CreatedUtc = File.GetLastWriteTimeUtc(CorruptJournalPath) }
+                : null;
+        }
+    }
 
     public void SaveJournal(RestoreJournal journal) => Write(JournalPath, journal);
 
@@ -184,6 +226,7 @@ public sealed class ConeErrorStore
             try
             {
                 File.Delete(JournalPath);
+                File.Delete(CorruptJournalPath);
             }
             catch (Exception ex)
             {

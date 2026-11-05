@@ -18,10 +18,22 @@ namespace TouchNStars.Server.Controllers;
 /// </summary>
 public class PinsController : WebApiController
 {
-    private static readonly Type PINSType = Type.GetType("NINA.PINS.PINS, NINA.PINS");
-    private static readonly Type PowerBoxDriverType = Type.GetType("NINA.PINS.Drivers.PowerBoxDriver, NINA.PINS");
-    private static readonly Type MeteoStationDriverType = Type.GetType("NINA.PINS.Drivers.MeteoStationDriver, NINA.PINS");
-    private static readonly Type LensControlDriverType = Type.GetType("NINA.PINS.Drivers.LensControlDriver, NINA.PINS");
+    private static Type pinsType;
+
+    // Resolved on use, and only a found type is kept: as a static readonly field it was resolved once, at the first request.
+    // Each plugin loads in an AssemblyLoadContext of its own, and NINA.PINS can only be found once it is loaded; the app's
+    // first requests come right after TNS starts its web server, which can be before that, and the null then stayed for the
+    // whole night (every PINS endpoint answered "not connected")
+    private static Type PINSType => pinsType ??= FindPinsType();
+
+    private static Type FindPinsType()
+    {
+        return Type.GetType("NINA.PINS.PINS, NINA.PINS")
+            ?? AppDomain.CurrentDomain.GetAssemblies()
+                .Where(a => a.GetName().Name == "NINA.PINS")
+                .Select(a => a.GetType("NINA.PINS.PINS"))
+                .FirstOrDefault(t => t != null);
+    }
 
     private static object GetPINSConnectedPowerBox()
     {

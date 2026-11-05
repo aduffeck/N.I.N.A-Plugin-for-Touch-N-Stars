@@ -113,6 +113,7 @@ namespace TouchNStars.Server {
                     AutofocusWatcher.Start();
                     FlatTargetNameService.Start();
                     FilterOffsetController.RecoverInterruptedRun();
+                    ConeError.Session.ConeErrorService.Instance.WarnAboutOpenRestore();
                 }
             } catch (Exception ex) {
                 Logger.Error($"failed to start web server: {ex}");
