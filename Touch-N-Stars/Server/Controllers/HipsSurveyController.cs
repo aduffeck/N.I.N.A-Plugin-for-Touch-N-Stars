@@ -53,6 +53,7 @@ public class HipsSurveyController : WebApiController
                 status.LegacyFormat,
                 status.TotalBytes,
                 status.FreeBytes,
+                status.ReserveBytes,
                 status.Orders,
                 status.Job,
                 minOrder = service.Definition.MinOrder,

@@ -513,13 +513,22 @@ public sealed class ConeErrorService
         return session.GetStatus();
     }
 
+    // Called from a running measurement's pier label check: a settings file that cannot be read or written only
+    // means the labels are asked for again next time, it does not end the measurement.
     private void RememberPierLabels(string key)
     {
-        ConeErrorSettings settings = Store.LoadSettings();
-        if (!settings.VerifiedPierLabels.Contains(key))
+        try
         {
-            settings.VerifiedPierLabels.Add(key);
-            Store.SaveSettings(settings);
+            ConeErrorSettings settings = Store.LoadSettings();
+            if (!settings.VerifiedPierLabels.Contains(key))
+            {
+                settings.VerifiedPierLabels.Add(key);
+                Store.SaveSettings(settings);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"ConeError: could not remember the confirmed pier side labels: {ex.Message}");
         }
     }
 

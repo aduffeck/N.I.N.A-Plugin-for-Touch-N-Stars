@@ -53,8 +53,8 @@ public class SettingsController : WebApiController
                 var (stamp, length) = FileStamp();
                 if (_fileCache == null || stamp != _fileCacheStampUtc || length != _fileCacheLength)
                 {
-                    // Load moves an unreadable file aside and may restore the backup, so the
-                    // stamp is taken afterwards: a file that stays unreadable or missing is
+                    // Load moves an unparsable file aside and may restore the backup, so the
+                    // stamp is taken afterwards: a file that stays unparsable or missing is
                     // then not read (and warned about) again for every saved image.
                     _fileCache = LoadLocked();
                     (_fileCacheStampUtc, _fileCacheLength) = FileStamp();
@@ -63,7 +63,19 @@ public class SettingsController : WebApiController
             catch (Exception ex)
             {
                 Logger.Warning($"Failed to read the settings file: {ex.Message}");
-                _fileCache = null;
+
+                // A file that cannot be read (I/O, permissions) stays in place and throws on every load: it counts as
+                // empty until it changes, so it is not warned about again for every saved image.
+                _fileCache = new Dictionary<string, string>();
+                try
+                {
+                    (_fileCacheStampUtc, _fileCacheLength) = FileStamp();
+                }
+                catch (Exception)
+                {
+                    _fileCache = null;
+                }
+
                 return false;
             }
 

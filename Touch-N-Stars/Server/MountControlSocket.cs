@@ -29,11 +29,14 @@ namespace TouchNStars.Server;
 /// </summary>
 public class MountControlSocket : WebSocketModule
 {
-    private static readonly TimeSpan DeadManTimeout = TimeSpan.FromSeconds(1.8);
+    // ~2.5 keepalives of the client
+    private static readonly TimeSpan DeadManTimeout = TimeSpan.FromSeconds(2);
 
     // also serializes the device calls, so a dead-man stop and a fresh move reach the mount in order
     private static readonly object _lock = new object();
-    private static DateTime _lastMoveAt;
+
+    // counts the move and stop messages; a scheduled dead-man stop only acts if no message came after its own
+    private static long _messageCount;
     private static string _lastDirection = string.Empty;
 
     /// <summary>
@@ -141,7 +144,7 @@ public class MountControlSocket : WebSocketModule
                 lock (_lock)
                 {
                     // a pending dead-man stop has nothing left to do
-                    _lastMoveAt = DateTime.UtcNow;
+                    _messageCount++;
                     _lastDirection = string.Empty;
                     StopAll(mover);
                 }
@@ -156,7 +159,7 @@ public class MountControlSocket : WebSocketModule
             return Error(refusal);
         }
 
-        DateTime scheduledAt;
+        long message;
         lock (_lock)
         {
             if (mover.Resends || _lastDirection != direction)
@@ -164,39 +167,37 @@ public class MountControlSocket : WebSocketModule
                 mover.Move(axis, sign);
             }
 
-            _lastMoveAt = DateTime.UtcNow;
+            message = ++_messageCount;
             _lastDirection = direction;
-            scheduledAt = _lastMoveAt;
         }
-        ScheduleDeadManStop(mover, scheduledAt);
+        ScheduleDeadManStop(mover, message);
 
         return new ApiResponse { Success = true, Response = "Moving", StatusCode = 200, Type = "MountControl" };
     }
 
     /// <summary>
-    /// Stops all motion if no newer move message arrived after <paramref name="scheduledAt"/>.
-    /// The timestamp acts as a token: each move records a fresh <see cref="_lastMoveAt"/>, so a
-    /// later message invalidates this scheduled stop.
+    /// Stops all motion if no message arrived within <see cref="DeadManTimeout"/> after move message
+    /// number <paramref name="message"/>. The count is the token, not the wall clock: the app sets the
+    /// system time of the Pi, and a clock set back during a slew made the elapsed time negative, so the
+    /// stop was skipped and the mount kept moving. Task.Delay itself runs on the monotonic clock.
     /// </summary>
-    private static void ScheduleDeadManStop(Mover mover, DateTime scheduledAt)
+    private static void ScheduleDeadManStop(Mover mover, long message)
     {
         _ = Task.Run(async () =>
         {
-            await Task.Delay(DeadManTimeout + TimeSpan.FromMilliseconds(200));
+            await Task.Delay(DeadManTimeout);
             try
             {
                 lock (_lock)
                 {
-                    if (_lastMoveAt != scheduledAt)
+                    if (_messageCount != message)
                     {
-                        return; // a newer move superseded this one
+                        return; // a newer message superseded this one
                     }
-                    if (DateTime.UtcNow - _lastMoveAt >= DeadManTimeout)
-                    {
-                        // cleared first, so that a failed stop doesn't keep the next move from being sent
-                        _lastDirection = string.Empty;
-                        StopAll(mover);
-                    }
+
+                    // cleared first, so that a failed stop doesn't keep the next move from being sent
+                    _lastDirection = string.Empty;
+                    StopAll(mover);
                 }
             }
             catch (Exception ex)

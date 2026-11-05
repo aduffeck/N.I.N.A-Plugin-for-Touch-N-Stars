@@ -10,6 +10,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Net.Http.Json;
 using System.Reflection;
 using System.Text.Json;
 using System.Threading;
@@ -760,7 +761,16 @@ public partial class FilterOffsetController : WebApiController
             await StartAutofocusWithRetryAsync(apiUrl, client, filter, token);
 
             // Wait until the AF file watcher (BackgroundWorker) signals completion
-            await WaitForAutofocusAsync(token);
+            try
+            {
+                await WaitForAutofocusAsync(token);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException || ex is TimeoutException)
+            {
+                // stopping the calibration, or giving up on the run, left the AutoFocus running on its own
+                await CancelAutofocusAsync(apiUrl, client);
+                throw;
+            }
 
             string failure = null;
             int? position = null;
@@ -908,35 +918,169 @@ public partial class FilterOffsetController : WebApiController
         // giving up with a clear error instead of hanging.
         var deadline = DateTime.UtcNow.AddMinutes(3);
 
+        // what afRun goes back to when no AutoFocus could be started
+        bool wasRunning;
+        lock (DataContainer.lockObj)
+        {
+            wasRunning = DataContainer.afRun;
+        }
+
+        // an attempt of this call that ninaAPI started: its run may still be going (a later "already running" is
+        // then most likely that run), and a stop has to cancel it
+        bool accepted = false;
+
+        // the first ChangeFilter would turn the wheel under a run someone else started
+        await WaitForRunningAutofocusAsync(deadline, TimeSpan.Zero, token);
+
         for (var attempt = 1; ; attempt++)
         {
-            token.ThrowIfCancellationRequested();
-
-            // Re-assert the target filter right before every trigger attempt, including retries — a
-            // previous run's delayed cleanup can revert the wheel between attempts (see
-            // MeasureFilterFocusPositionAsync), and this is the last write before AF captures "current
-            // filter" as the run's imaging filter.
-            await TouchNStars.Mediators.FilterWheel.ChangeFilter(filter, token);
-
-            // Reset AF tracking state and start AF (ninaAPI call is async: returns "started" immediately)
-            lock (DataContainer.lockObj)
+            // from sending the request until its answer is read, ninaAPI may have started a run
+            bool unanswered = false;
+            try
             {
-                DataContainer.afRun = true;
-                DataContainer.afError = false;
-                DataContainer.afErrorText = string.Empty;
-                DataContainer.newAfGraph = false;
-                DataContainer.afStartConfirmed = false;
+                token.ThrowIfCancellationRequested();
+
+                // Re-assert the target filter right before every trigger attempt, including retries — a
+                // previous run's delayed cleanup can revert the wheel between attempts (see
+                // MeasureFilterFocusPositionAsync), and this is the last write before AF captures "current
+                // filter" as the run's imaging filter.
+                await TouchNStars.Mediators.FilterWheel.ChangeFilter(filter, token);
+
+                // Reset AF tracking state and start AF (ninaAPI call is async: returns "started" immediately)
+                lock (DataContainer.lockObj)
+                {
+                    DataContainer.afRun = true;
+                    DataContainer.afError = false;
+                    DataContainer.afErrorText = string.Empty;
+                    DataContainer.newAfGraph = false;
+                    DataContainer.afStartConfirmed = false;
+                }
+
+                unanswered = true;
+                string refusal;
+                using (var response = await client.GetAsync($"{apiUrl}/equipment/focuser/auto-focus", token))
+                {
+                    refusal = await AutofocusRefusalAsync(response, token);
+                }
+
+                unanswered = false;
+
+                if (refusal == null)
+                {
+                    accepted = true;
+                    if (await WaitForAutofocusStartAsync(token)) return;
+                }
+                else
+                {
+                    // afRun goes back to what it was, else the app shows an AutoFocus running that ninaAPI refused
+                    if (!accepted)
+                        RestoreAfRun(wasRunning);
+
+                    // a refusal other than the previous run still going (no focuser connected) does not go away by
+                    // retrying for 3 minutes
+                    if (!refusal.Contains(AutofocusAlreadyRunning, StringComparison.OrdinalIgnoreCase))
+                        throw new Exception($"AutoFocus could not be started for filter '{filter.Name}': {refusal}");
+                }
+
+                if (DateTime.UtcNow >= deadline)
+                {
+                    // a run of this call that never confirmed its start is not left behind
+                    if (accepted)
+                        await CancelAutofocusAsync(apiUrl, client);
+                    else
+                        RestoreAfRun(wasRunning);
+
+                    throw new Exception($"AutoFocus did not start for filter '{filter.Name}' after {attempt} attempts — a previous AutoFocus run may be stuck (see NINA log)");
+                }
+
+                Logger.Warning($"FilterOffset: AutoFocus for filter '{filter.Name}' did not start (attempt {attempt}, {refusal ?? "no start broadcast"}, previous run likely still finishing) — retrying");
+                if (refusal == null)
+                {
+                    await Task.Delay(5000, token);
+                }
+                else
+                {
+                    // a refusal is answered at once, without the 20 s wait for the start broadcast
+                    await WaitForRunningAutofocusAsync(deadline, TimeSpan.FromSeconds(5), token);
+                }
             }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                // stopped: a run ninaAPI may have started for this call is cancelled; one it refused for is not ours
+                if (accepted || unanswered)
+                    await CancelAutofocusAsync(apiUrl, client);
+                else
+                    RestoreAfRun(wasRunning);
 
-            await client.GetAsync($"{apiUrl}/equipment/focuser/auto-focus", token);
+                throw;
+            }
+        }
+    }
 
-            if (await WaitForAutofocusStartAsync(token)) return;
+    private static void RestoreAfRun(bool value)
+    {
+        lock (DataContainer.lockObj)
+        {
+            DataContainer.afRun = value;
+        }
+    }
 
-            if (DateTime.UtcNow >= deadline)
-                throw new Exception($"AutoFocus did not start for filter '{filter.Name}' after {attempt} attempts — a previous AutoFocus run may be stuck (see NINA log)");
+    /// <summary>
+    /// Before an attempt, and after ninaAPI refused because an AutoFocus is still running: waits
+    /// <paramref name="delay"/> and then until HocusFocus' own guard is released, so the attempt's ChangeFilter does
+    /// not turn the wheel under a run someone else started (every 5 s for up to 3 minutes). Without HocusFocus only
+    /// the delay.
+    /// </summary>
+    private static async Task WaitForRunningAutofocusAsync(DateTime deadline, TimeSpan delay, CancellationToken token)
+    {
+        await Task.Delay(delay, token);
+        while (DateTime.UtcNow < deadline && IsHocusFocusAutoFocusInProgress() == true)
+        {
+            await Task.Delay(1000, token);
+        }
+    }
 
-            Logger.Warning($"FilterOffset: AutoFocus for filter '{filter.Name}' did not start (attempt {attempt}, previous run likely still finishing) — retrying");
-            await Task.Delay(5000, token);
+    // ninaAPI's answer while its previous AutoFocus run is still going (Focuser.cs)
+    private const string AutofocusAlreadyRunning = "already running";
+
+    /// <summary>
+    /// ninaAPI's error when it refused to start the AutoFocus, null when it started it or the answer is not ninaAPI's or
+    /// cannot be read (then the start broadcast decides, as before). ninaAPI always answers HTTP 200; its status is in the body.
+    /// </summary>
+    private static async Task<string> AutofocusRefusalAsync(HttpResponseMessage response, CancellationToken token)
+    {
+        ApiResponse body;
+        try
+        {
+            body = await response.Content.ReadFromJsonAsync<ApiResponse>(token);
+        }
+        catch (Exception) when (!token.IsCancellationRequested)
+        {
+            return null;
+        }
+
+        if (body == null || body.Success)
+            return null;
+
+        return string.IsNullOrWhiteSpace(body.Error) ? $"refused ({body.StatusCode})" : body.Error;
+    }
+
+    /// <summary>Asks ninaAPI to cancel its AutoFocus run; also after the calibration's own token was cancelled.</summary>
+    private static async Task CancelAutofocusAsync(string apiUrl, HttpClient client)
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            using var response = await client.GetAsync($"{apiUrl}/equipment/focuser/auto-focus?cancel=true", timeout.Token);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"FilterOffset: could not cancel the AutoFocus run: {ex.Message}");
+        }
+
+        lock (DataContainer.lockObj)
+        {
+            DataContainer.afRun = false;
         }
     }
 

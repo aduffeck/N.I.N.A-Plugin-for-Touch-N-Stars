@@ -19,16 +19,19 @@ public static class JsonFileStore
 
     /// <summary>
     /// The file at <paramref name="path"/>, else the backup of its last save, else <paramref name="empty"/>.
-    /// An unreadable file is moved aside as *.unreadable-&lt;time&gt;; a backup that was read instead is
-    /// written back as the file, so the next read and the next save start from it.
+    /// A file that cannot be parsed is moved aside as *.unreadable-&lt;time&gt;; a backup that was read instead is
+    /// written back as the file, so the next read and the next save start from it. A file or backup that cannot
+    /// be read (I/O, permissions) throws: its content may be fine, and the saves after an empty or backup read
+    /// would replace it.
     /// </summary>
     public static T Read<T>(string path, Func<string, T> parse, Func<T> empty, string what)
     {
         if (File.Exists(path))
         {
+            string text = File.ReadAllText(path);
             try
             {
-                return parse(File.ReadAllText(path));
+                return parse(text);
             }
             catch (Exception ex)
             {
@@ -42,11 +45,10 @@ public static class JsonFileStore
             return empty();
         }
 
-        string content;
+        string content = File.ReadAllText(backup);
         T result;
         try
         {
-            content = File.ReadAllText(backup);
             result = parse(content);
         }
         catch (Exception ex)

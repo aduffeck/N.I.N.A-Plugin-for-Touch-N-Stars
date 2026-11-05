@@ -159,7 +159,10 @@ public partial class InternalGuiderController
         return result;
     }
 
-    /// <summary>GET /api/internal-guider/coach/history?max=20 - stored reports, newest first, without raw samples.</summary>
+    /// <summary>
+    /// GET /api/internal-guider/coach/history?max=20 - stored reports, newest first, without raw samples. Like the
+    /// incidents they are files of the internal guider, read also while it is not connected or another guider is.
+    /// </summary>
     [Route(HttpVerbs.Get, "/internal-guider/coach/history")]
     public Task GetCoachHistory()
     {
@@ -167,7 +170,7 @@ public partial class InternalGuiderController
         {
             int max = QueryInt("max", DefaultHistory, 1, MaxHistory);
             return SendOk(coach.GetCoachHistory(max) ?? Array.Empty<AdvancedCoachReport>());
-        });
+        }, requireConnected: false);
     }
 
     /// <summary>POST /api/internal-guider/hints/dismiss - body { id }: hide a live hint for the rest of the guiding session.</summary>
@@ -191,11 +194,14 @@ public partial class InternalGuiderController
         });
     }
 
-    /// <summary>The coach routes: the connected internal guider, 501 when it has no <see cref="IGuidingCoach"/>.</summary>
-    private Task WithCoachAsync(string what, Func<IGuidingCoach, Task> handler)
+    /// <summary>
+    /// The coach routes: the connected internal guider or, unless <paramref name="requireConnected"/>, the internal guider
+    /// also while it or another guider is connected (as the incident routes); 501 when it has no <see cref="IGuidingCoach"/>.
+    /// </summary>
+    private Task WithCoachAsync(string what, Func<IGuidingCoach, Task> handler, bool requireConnected = true)
     {
-        return WithConnectedGuiderAsync(what, guider => guider is IGuidingCoach coach
+        return WithGuiderAsync(what, requireConnected, guider => guider is IGuidingCoach coach
             ? handler(coach)
-            : SendNotSupported("the Guiding Coach"));
+            : SendNotSupported("the Guiding Coach"), forIncidents: true);
     }
 }

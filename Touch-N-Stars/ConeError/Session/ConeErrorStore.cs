@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text.Json;
 using NINA.Core.Utility;
 using TouchNStars.ConeError.Domain;
+using TouchNStars.Utility;
 
 namespace TouchNStars.ConeError.Session;
 
@@ -127,7 +128,11 @@ public sealed class RestoreJournal
     public bool OriginalUnknown { get; set; }
 }
 
-/// <summary>JSON files of the wizard, in one directory, each written under a lock.</summary>
+/// <summary>
+/// JSON files of the wizard, in one directory, each written under a lock. Settings and results go through
+/// <see cref="JsonFileStore"/> (synced to disk, previous save kept as .bkp, an unparsable file moved aside); a file
+/// that cannot be read throws, so it is never replaced by a save that started from nothing.
+/// </summary>
 public sealed class ConeErrorStore
 {
     public const int MaxResults = 50;
@@ -150,16 +155,16 @@ public sealed class ConeErrorStore
     private string JournalPath => Path.Combine(Directory, "restore.json");
     private string CorruptJournalPath => Path.Combine(Directory, "restore.json.corrupt");
 
-    public ConeErrorSettings LoadSettings() => (Read<ConeErrorSettings>(SettingsPath) ?? new ConeErrorSettings()).Sanitized();
+    public ConeErrorSettings LoadSettings() => (Read<ConeErrorSettings>(SettingsPath, "cone error settings") ?? new ConeErrorSettings()).Sanitized();
 
     public ConeErrorSettings SaveSettings(ConeErrorSettings settings)
     {
         ConeErrorSettings clean = settings.Sanitized();
-        Write(SettingsPath, clean);
+        Save(SettingsPath, clean);
         return clean;
     }
 
-    public List<ConeResultRecord> LoadResults() => Read<List<ConeResultRecord>>(ResultsPath) ?? new List<ConeResultRecord>();
+    public List<ConeResultRecord> LoadResults() => Read<List<ConeResultRecord>>(ResultsPath, "cone error results") ?? new List<ConeResultRecord>();
 
     public void AddResult(ConeResultRecord result)
     {
@@ -167,7 +172,7 @@ public sealed class ConeErrorStore
         {
             List<ConeResultRecord> results = LoadResults();
             results.Add(result);
-            Write(ResultsPath, results.OrderByDescending(r => r.TimestampUtc).Take(MaxResults).OrderBy(r => r.TimestampUtc).ToList());
+            Save(ResultsPath, results.OrderByDescending(r => r.TimestampUtc).Take(MaxResults).OrderBy(r => r.TimestampUtc).ToList());
         }
     }
 
@@ -235,22 +240,23 @@ public sealed class ConeErrorStore
         }
     }
 
-    private T Read<T>(string path) where T : class
+    private T Read<T>(string path, string what) where T : class
     {
         lock (fileLock)
         {
-            try
-            {
-                return File.Exists(path) ? JsonSerializer.Deserialize<T>(File.ReadAllText(path), Json) : null;
-            }
-            catch (Exception ex)
-            {
-                Logger.Warning($"ConeError: could not read {path}: {ex.Message}");
-                return null;
-            }
+            return JsonFileStore.Read(path, json => JsonSerializer.Deserialize<T>(json, Json), () => null, what);
         }
     }
 
+    private void Save<T>(string path, T value)
+    {
+        lock (fileLock)
+        {
+            JsonFileStore.Write(path, JsonSerializer.Serialize(value, Json));
+        }
+    }
+
+    // The restore journal keeps its own handling (LoadJournal, ClearJournal): no backup, so a cleared journal stays gone.
     private void Write<T>(string path, T value)
     {
         lock (fileLock)

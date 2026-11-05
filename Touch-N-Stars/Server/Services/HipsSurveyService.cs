@@ -34,6 +34,11 @@ public sealed class HipsSurveyService
     public const int TileWidth = 512;
     public const double FreeSpaceMargin = 0.10;
 
+    // Left free on the drive by a download, for the night's images and NINA itself: a tenth of the drive, at least
+    // 5 GB (a Pi's SD card) and at most 20 GB (a large disk needs no tenth). 5 GB when the drive size is unknown.
+    public const long MinReserveBytes = 5_000_000_000;
+    public const long MaxReserveBytes = 20_000_000_000;
+
     private const string SurveysFolderName = "surveys";
     private const string PropertiesFileName = "properties";
     private const string MocFileName = "Moc.fits";
@@ -259,6 +264,7 @@ public sealed class HipsSurveyService
     {
         string root = ResolveRoot(createIfMissing: false);
         SurveyInventory inventory = GetInventory(root);
+        DriveSpace space = GetDriveSpace(root);
         DownloadJob current;
         lock (sync)
         {
@@ -274,7 +280,8 @@ public sealed class HipsSurveyService
             HasAllsky = inventory.HasAllsky,
             LegacyFormat = inventory.HasLegacyTiles,
             TotalBytes = inventory.TotalBytes,
-            FreeBytes = GetFreeBytes(root),
+            FreeBytes = space?.Free,
+            ReserveBytes = ReserveFor(space),
             Orders = inventory.Orders,
             Job = current?.Snapshot()
         };
@@ -301,13 +308,15 @@ public sealed class HipsSurveyService
             missingBytes += EstimateBytes(Definition, state.Order, missing);
         }
 
-        long? free = GetFreeBytes(root);
+        DriveSpace space = GetDriveSpace(root);
         long required = (long)Math.Ceiling(missingBytes * (1 + FreeSpaceMargin));
-        if (free.HasValue && missingTiles > 0 && free.Value < required)
+        long reserve = ReserveFor(space);
+        if (space != null && missingTiles > 0 && space.Free - reserve < required)
         {
             return OperationResult.Fail(
                 507,
-                $"Not enough free disk space: about {required / 1_000_000} MB needed, {free.Value / 1_000_000} MB free.");
+                $"Not enough free disk space: about {required / 1_000_000} MB needed and {reserve / 1_000_000} MB kept free " +
+                $"for images, {space.Free / 1_000_000} MB free.");
         }
 
         lock (StartGate)
@@ -1023,7 +1032,16 @@ public sealed class HipsSurveyService
         }
     }
 
-    private long? GetFreeBytes(string root)
+    private static long ReserveFor(DriveSpace space)
+    {
+        return space?.Total > 0
+            ? Math.Clamp(space.Total / 10, MinReserveBytes, MaxReserveBytes)
+            : MinReserveBytes;
+    }
+
+    private sealed record DriveSpace(long Free, long Total);
+
+    private DriveSpace GetDriveSpace(string root)
     {
         try
         {
@@ -1038,7 +1056,21 @@ public sealed class HipsSurveyService
                 return null;
             }
 
-            return new DriveInfo(probe).AvailableFreeSpace;
+            var drive = new DriveInfo(probe);
+            long free = drive.AvailableFreeSpace;
+
+            // the free space alone is still checked without the drive size (then the minimum reserve)
+            long total = 0;
+            try
+            {
+                total = drive.TotalSize;
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug($"{LogPrefix} Drive size unavailable: {ex.Message}");
+            }
+
+            return new DriveSpace(free, total);
         }
         catch (Exception ex)
         {
@@ -1203,6 +1235,10 @@ public sealed class HipsSurveyService
         public bool LegacyFormat { get; set; }
         public long TotalBytes { get; set; }
         public long? FreeBytes { get; set; }
+
+        /// <summary>Space a download leaves free (<see cref="MinReserveBytes"/>..<see cref="MaxReserveBytes"/>).</summary>
+        public long ReserveBytes { get; set; }
+
         public List<OrderState> Orders { get; set; }
         public SurveyJobStatus Job { get; set; }
     }

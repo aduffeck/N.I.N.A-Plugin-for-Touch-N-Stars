@@ -22,6 +22,9 @@ public class TilterService
     private readonly ConcurrentDictionary<int, TilterDeviceInfo> ConnectedDevices = new();
     private const int MaxDevices = 32;
 
+    // The last status read error per device, so the 1 s polling logs a device that cannot be read once, not every second.
+    private readonly ConcurrentDictionary<int, string> StatusErrors = new();
+
     /// <summary>Screw ring radius of the Wanderer ETA, used when the device reports none.</summary>
     private const double DefaultEtaRadius = 78.0;
 
@@ -264,6 +267,9 @@ public class TilterService
                 Version = version
             };
 
+            // a status error of an earlier connection is logged again
+            StatusErrors.TryRemove(deviceId, out _);
+
             Logger.Info($"TilterService: Successfully connected to device {deviceId}");
             return true;
         }
@@ -306,6 +312,7 @@ public class TilterService
 
             // Remove from connected devices
             ConnectedDevices.TryRemove(deviceId, out _);
+            StatusErrors.TryRemove(deviceId, out _);
 
             Logger.Info($"TilterService: Successfully disconnected device {deviceId}");
             return true;
@@ -333,7 +340,7 @@ public class TilterService
                 status.CurrentPosition1 = 0;
                 status.CurrentPosition2 = 0;
                 status.CurrentPosition3 = 0;
-                Logger.Info($"TilterService: Manual tilter (device {deviceId}) - returning default status");
+                Logger.Trace($"TilterService: Manual tilter (device {deviceId}) - returning default status");
                 return status;
             }
 
@@ -343,7 +350,7 @@ public class TilterService
 
             if (result != WandererSDK.WTErrorType.Success)
             {
-                Logger.Error($"TilterService: Failed to get status for device {deviceId}: {result}");
+                LogStatusError(deviceId, $"Failed to get status for device {deviceId}: {result}");
                 status.Error = $"The tilter's state could not be read ({result})";
                 return status;
             }
@@ -359,14 +366,30 @@ public class TilterService
 
             // Calculate image plane corner values
             CalculateImagePlaneCorners(status, radius);
+
+            if (StatusErrors.TryRemove(deviceId, out _))
+            {
+                Logger.Info($"TilterService: The status of device {deviceId} can be read again");
+            }
         }
         catch (Exception ex)
         {
-            Logger.Error($"TilterService: Error getting status for device {deviceId}: {ex.Message}");
+            LogStatusError(deviceId, $"Error getting status for device {deviceId}: {ex.Message}");
             status.Error = $"The tilter's state could not be read ({ex.Message})";
         }
 
         return status;
+    }
+
+    private void LogStatusError(int deviceId, string message)
+    {
+        if (StatusErrors.TryGetValue(deviceId, out var last) && last == message)
+        {
+            return;
+        }
+
+        StatusErrors[deviceId] = message;
+        Logger.Error($"TilterService: {message}");
     }
 
     /// <summary>

@@ -170,13 +170,10 @@ public class HocusFocusController : WebApiController
             {
                 int regionIndex = 0;
                 // Create a snapshot of the regions to avoid collection modification exceptions
-                var regionsSnapshot = regionsEnumerable.Cast<object>().ToList();
-                var curveFittingsSnapshot = (regionCurveFittingsValue is System.Collections.IEnumerable curvesEnum)
-                    ? curvesEnum.OfType<object>().ToList()
-                    : new List<object>();
-                var lineFittingsSnapshot = (regionLineFittingsValue is System.Collections.IEnumerable linesEnum)
-                    ? linesEnum.OfType<object>().ToList()
-                    : new List<object>();
+                var regionsSnapshot = SnapshotOf(regionsEnumerable);
+                // a region without a fit keeps its null entry, so the indexes stay aligned with the regions
+                var curveFittingsSnapshot = SnapshotOf(regionCurveFittingsValue);
+                var lineFittingsSnapshot = SnapshotOf(regionLineFittingsValue);
 
                 foreach (var region in regionsSnapshot)
                 {
@@ -184,7 +181,7 @@ public class HocusFocusController : WebApiController
                     if (region is System.Collections.IEnumerable regionEnumerable)
                     {
                         // Create a snapshot of the region to avoid collection modification exceptions
-                        var regionSnapshot = regionEnumerable.Cast<object>().ToList();
+                        var regionSnapshot = SnapshotOf(regionEnumerable);
                         foreach (var focusPoint in regionSnapshot)
                         {
                             regionList.Add(SerializeObject(focusPoint));
@@ -339,7 +336,7 @@ public class HocusFocusController : WebApiController
             var regionFinalFocusPointsValue = regionFinalFocusPoints.GetValue(inspectorVM);
             if (regionFinalFocusPointsValue != null && regionFinalFocusPointsValue is System.Collections.IEnumerable pointsEnumerable)
             {
-                foreach (var focusPoint in pointsEnumerable)
+                foreach (var focusPoint in SnapshotOf(pointsEnumerable))
                 {
                     serializedPoints.Add(SerializeObject(focusPoint));
                 }
@@ -1179,6 +1176,32 @@ public class HocusFocusController : WebApiController
     }
 
     /// <summary>
+    /// A copy of a HocusFocus collection, or an empty list when the value is not one. The plot series, region focus
+    /// points, tilt models and star lists are filled on HocusFocus' own threads while a run is in progress, so the
+    /// copy is tried again when the collection changes underneath it; the third failure is thrown, so an endpoint
+    /// reports an error rather than success without data.
+    /// </summary>
+    private static List<object> SnapshotOf(object collection)
+    {
+        if (collection is not System.Collections.IEnumerable items)
+        {
+            return new List<object>();
+        }
+
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return items.Cast<object>().ToList();
+            }
+            catch (InvalidOperationException) when (attempt < 3)
+            {
+                // modified while being copied; try again
+            }
+        }
+    }
+
+    /// <summary>
     /// HocusFocus' AutoFocus panel: the chart (points with their HFR error bars, rejected outliers, focus-window
     /// exclusions, the fitted curves, the final point with its σ(focus) error bar) and the metrics beside it.
     /// Read from the current HocusFocusVM, so while a run is in progress (InProgress) it describes that run so far.
@@ -1233,26 +1256,6 @@ public class HocusFocusController : WebApiController
             // NaN is not a valid JSON number; HocusFocus uses it (and 0 / -1 for the HFRs and positions) for "unknown".
             double? Num(double value) => double.IsFinite(value) ? value : null;
             double? Positive(double value) => double.IsFinite(value) && value > 0 ? value : null;
-            // The plot series are filled on the AF engine's thread while a run is in progress.
-            List<object> Snapshot(object series)
-            {
-                if (series is not System.Collections.IEnumerable items)
-                {
-                    return new List<object>();
-                }
-                for (var attempt = 0; attempt < 3; attempt++)
-                {
-                    try
-                    {
-                        return items.Cast<object>().ToList();
-                    }
-                    catch (InvalidOperationException)
-                    {
-                        // Modified while being copied; try again.
-                    }
-                }
-                return new List<object>();
-            }
             string Describe(object enumValue)
             {
                 if (enumValue == null)
@@ -1291,7 +1294,7 @@ public class HocusFocusController : WebApiController
 
             // Points, flagged the way the chart marks them: red crosses for outliers the fit rejected, hollow
             // rings for points outside the symmetric focus window.
-            HashSet<long> PositionsOf(object series) => Snapshot(series)
+            HashSet<long> PositionsOf(object series) => SnapshotOf(series)
                 .Select(p => GetDouble(p, "X"))
                 .Where(double.IsFinite)
                 .Select(x => (long)Math.Round(x))
@@ -1300,7 +1303,7 @@ public class HocusFocusController : WebApiController
             var excludedPositions = PositionsOf(Get(currentVM, "PlotWindowExcludedFocusPoints"));
             var points = new List<Dictionary<string, object>>();
             var xs = new List<double>();
-            foreach (var point in Snapshot(Get(currentVM, "FocusPoints")))
+            foreach (var point in SnapshotOf(Get(currentVM, "FocusPoints")))
             {
                 var x = GetDouble(point, "X");
                 var y = GetDouble(point, "Y");
@@ -1325,7 +1328,7 @@ public class HocusFocusController : WebApiController
             var finalFocusPoint = Get(currentVM, "FinalFocusPoint");
             var finalX = GetDouble(finalFocusPoint, "X");
             var finalY = GetDouble(finalFocusPoint, "Y");
-            var finalWithError = Snapshot(Get(currentVM, "PlotFinalFocusPointWithError")).FirstOrDefault();
+            var finalWithError = SnapshotOf(Get(currentVM, "PlotFinalFocusPointWithError")).FirstOrDefault();
             var focusError = Positive(GetDouble(finalWithError, "ErrorX"));
             var minimumStdError = GetDouble(hyperbolicFitting, "MinimumStdError");
             var hasFinalPoint = double.IsFinite(finalX) && finalX >= 0 && double.IsFinite(finalY);
@@ -1577,7 +1580,7 @@ public class HocusFocusController : WebApiController
             var analysisResults = new List<object>();
             if (Get(result, "AnalysisResults") is System.Collections.IEnumerable rows)
             {
-                foreach (var row in rows.Cast<object>().ToList())
+                foreach (var row in SnapshotOf(rows))
                 {
                     analysisResults.Add(new Dictionary<string, object>()
                     {
@@ -1589,10 +1592,9 @@ public class HocusFocusController : WebApiController
                 }
             }
 
-            var registrationReport = (Get(sensorModel, "RegistrationAndFitReport") as System.Collections.IEnumerable)?
-                .Cast<object>()
+            var registrationReport = SnapshotOf(Get(sensorModel, "RegistrationAndFitReport"))
                 .Select(line => line?.ToString())
-                .ToList() ?? new List<string>();
+                .ToList();
 
             return new Dictionary<string, object>()
             {
@@ -1667,7 +1669,7 @@ public class HocusFocusController : WebApiController
             var stars = new List<(double X, double Y, double Eccentricity, double Theta)>();
             if (Get(result, "StarList") is System.Collections.IEnumerable starList)
             {
-                foreach (var star in starList.Cast<object>().ToList())
+                foreach (var star in SnapshotOf(starList))
                 {
                     var psf = Get(star, "PSF");
                     if (psf == null)
@@ -1868,7 +1870,7 @@ public class HocusFocusController : WebApiController
             }
             if (Get(result, "StarList") is System.Collections.IEnumerable starList)
             {
-                foreach (var star in starList.Cast<object>().ToList())
+                foreach (var star in SnapshotOf(starList))
                 {
                     var psf = Get(star, "PSF");
                     if (psf == null)
@@ -2411,7 +2413,7 @@ public class HocusFocusController : WebApiController
             var cornersArray = new List<Dictionary<string, object>>();
 
             // Iterate through the SensorTiltModels collection
-            foreach (var sensorTiltModel in (System.Collections.IEnumerable)sensorTiltModels)
+            foreach (var sensorTiltModel in SnapshotOf(sensorTiltModels))
             {
                 var cornerData = new Dictionary<string, object>();
                 var sensorTiltModelType = sensorTiltModel.GetType();
@@ -2594,7 +2596,7 @@ public class HocusFocusController : WebApiController
             var historyArray = new List<Dictionary<string, object>>();
 
             // Iterate through the history collection
-            foreach (var historyModel in (System.Collections.IEnumerable)historyModels)
+            foreach (var historyModel in SnapshotOf(historyModels))
             {
                 var historyModelType = historyModel.GetType();
                 var historyData = new Dictionary<string, object>();
