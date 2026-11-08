@@ -93,12 +93,12 @@ A cycle runs from the start of one capture to the start of the next; `fps` is 10
 | Method | Route | Parameters | Response |
 |---|---|---|---|
 | GET | `/coach` | | `AdvancedCoachStatus` of the current or last session (`phase` `Idle` before the first). It always carries the camera's gain range and current exposure and gain. |
-| POST | `/coach/start` | `AdvancedCoachOptions`: `{ steps, exposureSeconds, gains, framesPerCombination, driftSeconds, trialSeconds, repeatBaseline, allowCalibration }`, all optional | `{ action: "coach-start", accepted, pending, status }`. `steps` are `CameraCheck`, `Drift`, `MountResponse` and `Trials` (empty: all); empty lists mean the guider's defaults. A refusal is 409 `Rejected` with `messageCode` and `messageParameters`, and leaves the status of a running or last session untouched. Progress arrives as `coach` messages. |
+| POST | `/coach/start` | `AdvancedCoachOptions`: `{ steps, exposureSeconds, gains, framesPerCombination, driftSeconds, trialSeconds, repeatBaseline, exposureTrial, allowCalibration }`, all optional | `{ action: "coach-start", accepted, pending, status }`. `steps` are `CameraCheck`, `Drift`, `MountResponse` and `Trials` (empty: all); empty lists mean the guider's defaults. A refusal is 409 `Rejected` with `messageCode` and `messageParameters`, and leaves the status of a running or last session untouched. Progress arrives as `coach` messages. |
 | POST | `/coach/skip` | | Skip the running step; its usable partial results are kept. `{ action: "coach-skip", accepted, pending, status }`. |
 | POST | `/coach/cancel` | | Cancel the session; temporary settings are restored. `{ action: "coach-cancel", accepted, pending, status }`. |
 | POST | `/coach/apply` | `{ ids }`: finding ids, `trial:<id>`, or ids of active live hints; at most 50 | `{ action: "coach-apply", accepted, pending, status, applied }`. Applied hints are dismissed. 400 for unknown ids or ids without setting changes; 409 when there is nothing to apply. |
 | GET | `/coach/history` | `max` (20, 1..200) | Stored `AdvancedCoachReport`s, newest first, without raw samples. |
-| POST | `/hints/dismiss` | `{ id }` | `{ dismissed, hints }` with the hints still active. Hides the hint for the rest of the guiding session; 409 when it is no longer active. |
+| POST | `/hints/dismiss` | `{ id }` | `{ dismissed, hints }` with the hints still active. Hides the hint for the rest of the guiding session; one-time hints (`hint.longExposure`) for good, remembered in the profile. 409 when it is no longer active. |
 
 ## Flight recorder (incidents)
 
