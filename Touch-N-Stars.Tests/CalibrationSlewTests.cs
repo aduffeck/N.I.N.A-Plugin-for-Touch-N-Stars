@@ -5,6 +5,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using NINA.Astrometry;
 using NINA.Core.Enum;
+using NINA.Equipment.Equipment.MyGuider.Advanced;
+using NINA.Equipment.Interfaces;
 using NINA.Equipment.Equipment.MyTelescope;
 using NINA.Equipment.Interfaces.Mediator;
 using Newtonsoft.Json.Linq;
@@ -266,5 +268,111 @@ public class CalibrationSlewApiTests
 
         Assert.Equal(409, status);
         Assert.Contains("Connect the mount", (string?)json["error"]);
+    }
+
+    /// <summary>A fake guider whose StartCoach accepts and records what the mount had done by then.</summary>
+    private static FakeInternalGuider CoachGuider(Func<List<string>> callsSoFar, List<string> seenAtStart)
+    {
+        var fake = new FakeInternalGuider { State = "Stopped" };
+        fake.OnCall = (name, _) =>
+        {
+            if (name != nameof(IGuidingCoach.StartCoach)) return null;
+            lock (seenAtStart) seenAtStart.AddRange(callsSoFar());
+            return Task.FromResult(new AdvancedCoachStartResult { Accepted = true, Status = new AdvancedCoachStatus { Phase = "Running" } });
+        };
+        return fake;
+    }
+
+    [Fact]
+    public async Task CoachStart_WithSlew_SlewsThenStartsTheCoach()
+    {
+        var seenAtStart = new List<string>();
+        Rig? rig = null;
+        FakeInternalGuider fake = CoachGuider(() => rig!.Calls, seenAtStart);
+        rig = new Rig(fake, Mount(PierSide.pierWest));
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Slew = _ => release.Task;
+        using var host = new InternalGuiderApiHost(rig.Mediator, telescope: rig.Telescope);
+        var waitFor = EventWaiter.Collect(host.Service);
+
+        (int status, JObject json) = await host.Post("coach/start?slew=stay", "{}");
+        Assert.Equal(202, status);
+        Assert.True((bool)json["response"]!["pending"]!);
+        Assert.True(host.Service.CalibrationSlewInProgress);
+        Assert.Equal(409, (await host.Post("start-guiding?calibrate=true&slew=east")).Status);
+
+        release.SetResult(true);
+        JObject payload = EventWaiter.PayloadJson(await waitFor(e => e.Type == "action"));
+        Assert.Equal("coach-start", (string?)payload["action"]);
+        Assert.True((bool)payload["success"]!);
+        Assert.Equal(new[] { "StopGuiding", "Slew(10.3333,-1.0)", "Slew(10.3333,0.0)" }, seenAtStart);
+        Assert.False(host.Service.CalibrationSlewInProgress);
+    }
+
+    [Fact]
+    public async Task CoachStart_SlewFails_StartsNoSession()
+    {
+        var fake = new FakeInternalGuider { State = "Stopped" };
+        var rig = new Rig(fake, Mount()) { Slew = _ => Task.FromResult(false) };
+        using var host = new InternalGuiderApiHost(rig.Mediator, telescope: rig.Telescope);
+        var waitFor = EventWaiter.Collect(host.Service);
+
+        (int status, JObject json) = await host.Post("coach/start?slew=east", "{}");
+
+        // Fast enough to answer within the call timeout, or late as an action event.
+        string? error = status == 202
+            ? (string?)EventWaiter.PayloadJson(await waitFor(e => e.Type == "action"))["error"]
+            : (string?)json["error"];
+        Assert.Contains("the Guiding Coach did not start", error);
+        Assert.Empty(fake.CallsOf(nameof(IGuidingCoach.StartCoach)));
+        Assert.False(host.Service.CalibrationSlewInProgress);
+    }
+
+    [Fact]
+    public async Task CoachStart_StopCancelsTheSlew()
+    {
+        var slewStarted = new TaskCompletionSource();
+        var fake = new FakeInternalGuider { State = "Stopped" };
+        var rig = new Rig(fake, Mount());
+        rig.Slew = async ct =>
+        {
+            slewStarted.TrySetResult();
+            await Task.Delay(Timeout.Infinite, ct);
+            return true;
+        };
+        using var host = new InternalGuiderApiHost(rig.Mediator, telescope: rig.Telescope);
+        var waitFor = EventWaiter.Collect(host.Service);
+
+        Assert.Equal(202, (await host.Post("coach/start?slew=stay", "{}")).Status);
+        await slewStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        (_, JObject statusJson) = await host.Get("status");
+        Assert.True((bool)statusJson["response"]!["calibrationSlew"]!);
+
+        await host.Post("stop");
+
+        JObject payload = EventWaiter.PayloadJson(await waitFor(e => e.Type == "action" && (string?)EventWaiter.PayloadJson(e)["action"] == "coach-start"));
+        Assert.False((bool)payload["success"]!);
+        Assert.Contains("StopSlew", rig.Calls);
+        Assert.Empty(fake.CallsOf(nameof(IGuidingCoach.StartCoach)));
+        Assert.False(host.Service.CalibrationSlewInProgress);
+    }
+
+    [Theory]
+    [InlineData("coach/start?slew=north", false, 400, "stay, east or west")]
+    [InlineData("coach/start?slew=stay", true, 409, "parked")]
+    public async Task CoachStart_InvalidSlewOrParked_IsRefused(string path, bool parked, int expected, string message)
+    {
+        TelescopeInfo info = Mount();
+        info.AtPark = parked;
+        var fake = new FakeInternalGuider { State = "Stopped" };
+        var rig = new Rig(fake, info);
+        using var host = new InternalGuiderApiHost(rig.Mediator, telescope: rig.Telescope);
+
+        (int status, JObject json) = await host.Post(path, "{}");
+
+        Assert.Equal(expected, status);
+        Assert.Contains(message, (string?)json["error"]);
+        Assert.Empty(rig.Calls);
+        Assert.Empty(fake.CallsOf(nameof(IGuidingCoach.StartCoach)));
     }
 }

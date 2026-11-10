@@ -22,7 +22,11 @@ public partial class InternalGuiderController
         return WithCoachAsync("coach", coach => SendOk(InternalGuiderService.GetCoachStatus(coach)));
     }
 
-    /// <summary>POST /api/internal-guider/coach/start - body AdvancedCoachOptions: start a Guiding Coach session.</summary>
+    /// <summary>
+    /// POST /api/internal-guider/coach/start?slew=stay|east|west - body AdvancedCoachOptions: start a Guiding Coach session.
+    /// With slew the mount first slews to the calibration position on that side of the meridian (as before a calibration);
+    /// the answer is then mostly 202 and the outcome follows as a 'coach-start' action event.
+    /// </summary>
     [Route(HttpVerbs.Post, "/internal-guider/coach/start")]
     public Task StartCoach()
     {
@@ -35,7 +39,30 @@ public partial class InternalGuiderController
                 return;
             }
 
-            (GuiderCallOutcome outcome, AdvancedCoachStartResult result) = await Service.StartCoachAsync(coach, options);
+            CalibrationSlewSide? slew = null;
+            string slewValue = Query("slew");
+            if (!string.IsNullOrWhiteSpace(slewValue))
+            {
+                if (!CalibrationSlew.TryParseSide(slewValue, out CalibrationSlewSide side))
+                {
+                    await SendError(400, "InvalidRequest", "'slew' must be stay, east or west.");
+                    return;
+                }
+                string blocker = CalibrationSlew.Blocker(Service.Telescope?.GetInfo());
+                if (blocker != null)
+                {
+                    await SendError(409, "Rejected", blocker);
+                    return;
+                }
+                if (Service.CalibrationSlewInProgress)
+                {
+                    await SendError(409, "Rejected", "The mount is slewing to the calibration position.");
+                    return;
+                }
+                slew = side;
+            }
+
+            (GuiderCallOutcome outcome, AdvancedCoachStartResult result) = await Service.StartCoachAsync(coach, options, slew);
             if (outcome.State == GuiderCallState.Completed && !outcome.Success && !outcome.Cancelled && !outcome.Faulted)
             {
                 // Rejected: the reason comes with the start result (the session status is left alone).
@@ -48,7 +75,9 @@ public partial class InternalGuiderController
 
             await SendCallOutcome("coach-start", outcome,
                 () => result?.Status ?? InternalGuiderService.GetCoachStatus(coach),
-                "A Guiding Coach session is already starting.",
+                slew.HasValue && Service.CalibrationSlewInProgress
+                    ? "The mount is slewing to the calibration position."
+                    : "A Guiding Coach session is already starting.",
                 () => "The guider did not start the Guiding Coach.");
         });
     }

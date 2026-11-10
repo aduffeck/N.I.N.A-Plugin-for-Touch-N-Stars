@@ -66,6 +66,8 @@ public sealed class InternalGuiderService
     private CancellationTokenSource darksCts;
     private int ditherRunning;
     private int calibrationSlewRunning;
+    // 1 while a Guiding Coach start slews to the calibration position (Stop cancels it).
+    private int coachSlewRunning;
 
     /// <param name="internalGuiderProvider">The internal guider, also while it is not connected (pins exports it to plugins).</param>
     /// <param name="telescopeProvider">The mount, for the slew to the calibration position.</param>
@@ -518,11 +520,15 @@ public sealed class InternalGuiderService
         return true;
     }
 
-    /// <summary>Cancels a pending start (calibration/settling) issued through this API.</summary>
+    /// <summary>
+    /// Cancels a pending start (calibration/settling) issued through this API, and a Guiding Coach start while it slews
+    /// to the calibration position (Stop cancels that slew like the one before a calibration).
+    /// </summary>
     public void CancelGuidingStart()
     {
         CancellationTokenSource cts = Interlocked.Exchange(ref guidingStartCts, null);
         try { cts?.Cancel(); } catch (ObjectDisposedException) { }
+        if (Volatile.Read(ref coachSlewRunning) != 0) CancelSlot(coachStartSlot);
     }
 
     /// <summary>
@@ -635,15 +641,45 @@ public sealed class InternalGuiderService
     /// Starts a session. The outcome is Completed with Success = accepted; the guider's result (rejection
     /// reason, message code and parameters, status) comes along when the call returned in time.
     /// </summary>
-    public async Task<(GuiderCallOutcome Outcome, AdvancedCoachStartResult Result)> StartCoachAsync(IGuidingCoach coach, AdvancedCoachOptions options)
+    /// <param name="slew">
+    /// Slew to the calibration position on this side first: the guider stops for the slew, a slew that fails or is
+    /// cancelled (coach/cancel or Stop) starts no session. The call then mostly outlasts <see cref="CallTimeout"/> and
+    /// ends as an 'action' event. Refused (Busy) while another calibration slew runs.
+    /// </param>
+    public async Task<(GuiderCallOutcome Outcome, AdvancedCoachStartResult Result)> StartCoachAsync(IGuidingCoach coach, AdvancedCoachOptions options,
+        CalibrationSlewSide? slew = null)
     {
+        if (slew.HasValue && Interlocked.CompareExchange(ref calibrationSlewRunning, 1, 0) != 0)
+        {
+            return (GuiderCallOutcome.Busy(), null);
+        }
+
         AdvancedCoachStartResult result = null;
         GuiderCallOutcome outcome = await RunGuiderCallAsync("coach-start", async ct =>
         {
+            if (slew.HasValue)
+            {
+                Interlocked.Exchange(ref coachSlewRunning, 1);
+                try
+                {
+                    // No guide exposures during the slew; the coach picks a new star where the mount stops.
+                    if (Mediator != null) await Mediator.StopGuiding(ct).ConfigureAwait(false);
+                    await CalibrationSlew.SlewAsync(Telescope, slew.Value, ct, "the Guiding Coach did not start").ConfigureAwait(false);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref coachSlewRunning, 0);
+                    Interlocked.Exchange(ref calibrationSlewRunning, 0);
+                }
+            }
+
             AdvancedCoachStartResult r = await coach.StartCoach(options, ct).ConfigureAwait(false);
             Volatile.Write(ref result, r);
             return r?.Accepted == true;
         }, () => Volatile.Read(ref result)?.Message ?? "The Guiding Coach did not start.", coachStartSlot).ConfigureAwait(false);
+
+        // A start already in flight (Busy) never ran the call, so the slew flag is still ours to clear.
+        if (slew.HasValue && outcome.State == GuiderCallState.Busy) Interlocked.Exchange(ref calibrationSlewRunning, 0);
         return (outcome, Volatile.Read(ref result));
     }
 
