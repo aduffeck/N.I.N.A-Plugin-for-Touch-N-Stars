@@ -15,9 +15,16 @@ public static class CoreUtility {
     public static readonly string AfPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NINA", "AutoFocus");
     public static readonly string Hips2FitsUrl = "http://alasky.cds.unistra.fr/hips-image-services/hips2fits";
 
+    // Asks ninaAPI for its port on every call: the cached one is the default 1888 until something asked, and the API
+    // can be restarted on another port
     public static async Task<string> GetApiUrl() {
-        await TouchNStars.Communicator.GetPort();
-        return $"http://localhost:{Communicator.FoundPort}/v2/api";
+        int port = await TouchNStars.Communicator.GetPort(true);
+
+        if (port <= 0) {
+            throw new AdvancedApiNotRunningException();
+        }
+
+        return $"http://localhost:{port}/v2/api";
     }
 
     public static double HmsToDegrees(string hms) {
@@ -211,5 +218,12 @@ public static class CoreUtility {
         }
 
         return "127.0.0.1";
+    }
+}
+
+internal sealed class AdvancedApiNotRunningException : InvalidOperationException {
+
+    public AdvancedApiNotRunningException()
+        : base("The Advanced API web server is not running; start it in the Advanced API plugin settings") {
     }
 }

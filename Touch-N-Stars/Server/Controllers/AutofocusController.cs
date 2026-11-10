@@ -18,7 +18,6 @@ public class AutofocusController : WebApiController
     [Route(HttpVerbs.Get, "/autofocus/{action}")]
     public async Task<object> ControlAutofocus(string action)
     {
-        string targetUrl = $"{await CoreUtility.GetApiUrl()}/equipment/focuser/auto-focus";
         bool info = action.Equals("info");
         bool start = action.Equals("start");
         bool stop = action.Equals("stopp");
@@ -43,6 +42,7 @@ public class AutofocusController : WebApiController
 
             try
             {
+                string targetUrl = await AutofocusUrl();
                 HttpClient client = new HttpClient();
                 HttpResponseMessage response = await client.GetAsync(targetUrl);
 
@@ -65,6 +65,12 @@ public class AutofocusController : WebApiController
                     return new Dictionary<string, object>() { { "message", $"Fehler beim Starten des Autofokus: {response.StatusCode}" } };
                 }
             }
+            catch (AdvancedApiNotRunningException ex)
+            {
+                AutofocusNotStarted(wasRunning);
+                HttpContext.Response.StatusCode = 503;
+                return new Dictionary<string, object>() { { "error", ex.Message } };
+            }
             catch (Exception ex)
             {
                 AutofocusNotStarted(wasRunning);
@@ -81,6 +87,7 @@ public class AutofocusController : WebApiController
 
             try
             {
+                string targetUrl = await AutofocusUrl();
                 HttpClient client = new HttpClient();
                 HttpResponseMessage response = await client.GetAsync(targetUrl + "?cancel=true");
 
@@ -101,6 +108,11 @@ public class AutofocusController : WebApiController
                     return new Dictionary<string, object>() { { "message", $"Fehler beim Stoppen des Autofokus: {response.StatusCode}" } };
                 }
             }
+            catch (AdvancedApiNotRunningException ex)
+            {
+                HttpContext.Response.StatusCode = 503;
+                return new Dictionary<string, object>() { { "error", ex.Message } };
+            }
             catch (Exception ex)
             {
                 Logger.Error(ex);
@@ -110,6 +122,11 @@ public class AutofocusController : WebApiController
         }
 
         return new Dictionary<string, object>() { { "error", "Ungültige Anfrage" } };
+    }
+
+    private static async Task<string> AutofocusUrl()
+    {
+        return $"{await CoreUtility.GetApiUrl()}/equipment/focuser/auto-focus";
     }
 
     // afRun is set before the start: a refused start (no focuser, ninaAPI not reachable) left it set, and the app showed

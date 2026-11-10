@@ -15,11 +15,12 @@ namespace TouchNStars.Utility {
         }
 
         public Task OnMessageReceived(IMessage message) {
-            Logger.Info(message.Content.ToString());
-            if (int.TryParse(message.Content.ToString(), out int port)) {
-                Logger.Info("Recieved new port from api: " + port);
+            // GetApiUrl asks on every call: only a change is worth a log line
+            if (int.TryParse(message.Content?.ToString(), out int port) && port != FoundPort) {
+                Logger.Info($"Advanced API port changed from {FoundPort} to {port}");
                 FoundPort = port;
             }
+
             return Task.CompletedTask;
         }
 
