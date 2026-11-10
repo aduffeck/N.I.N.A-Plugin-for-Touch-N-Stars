@@ -366,7 +366,9 @@ namespace TouchNStars {
                     ["instanceId"] = mdnsMachineId.Value,
                     ["port"] = CachedPort.ToString()
                 };
-                if (address != null) {
+                // On Linux Avahi announces the host's current addresses, and the app falls back to them; a TXT "ip"
+                // resolved once went stale when the hotspot came up after NINA (and preferred 192.168.x over the AP).
+                if (address != null && !OperatingSystem.IsLinux()) {
                     txtProperties["ip"] = address.ToString();
                 }
 

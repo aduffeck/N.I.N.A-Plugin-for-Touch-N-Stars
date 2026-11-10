@@ -21,7 +21,7 @@ namespace TouchNStars.Server.Controllers;
 /// <summary>
 /// Controller for browsing and managing the local filesystem.
 /// Routes:
-///   GET    /api/filesystem/browse?path=...         — list directories and files
+///   GET    /api/filesystem/browse?path=...[&amp;offset=..&amp;limit=..] — list directories, then files (optionally a page)
 ///   POST   /api/filesystem/directory               — create a directory (body: { "path": "..." })
 ///   DELETE /api/filesystem/directory?path=...      — delete a directory (recursive)
 ///   GET    /api/filesystem/file?path=...&amp;download=1 — stream a file (binary)
@@ -33,6 +33,7 @@ namespace TouchNStars.Server.Controllers;
 public class FilesystemController : WebApiController
 {
     private const int StreamBufferSize = 81920;
+    private const int ExdevErrno = 18;
 
     private readonly ImagePreviewService previewService = new();
 
@@ -205,12 +206,32 @@ public class FilesystemController : WebApiController
                 return;
             }
 
+            // Optional paging over the folders, then the files, in the order listed: only the page is read from the
+            // disk. Without offset/limit everything is listed, as before.
+            if (!TryReadPaging(out int offset, out int? limit))
+            {
+                await SendJson(new { success = false, error = "offset and limit must be non-negative numbers, limit at least 1" }, 400);
+                return;
+            }
+
             var directories = new List<object>();
             var files = new List<object>();
+            int totalDirectories;
+            int totalFiles;
 
             try
             {
-                foreach (var dir in Directory.GetDirectories(fullPath).OrderBy(d => d))
+                var directoryPaths = Directory.GetDirectories(fullPath).OrderBy(d => d).ToList();
+                var filePaths = Directory.GetFiles(fullPath).OrderBy(f => f).ToList();
+                totalDirectories = directoryPaths.Count;
+                totalFiles = filePaths.Count;
+
+                int end = limit is { } count ? (int)Math.Min((long)offset + count, (long)totalDirectories + totalFiles) : totalDirectories + totalFiles;
+                var pageDirectories = directoryPaths.Skip(offset).Take(Math.Max(0, Math.Min(end, totalDirectories) - offset));
+                int fileStart = Math.Max(0, offset - totalDirectories);
+                var pageFiles = filePaths.Skip(fileStart).Take(Math.Max(0, end - totalDirectories - fileStart));
+
+                foreach (var dir in pageDirectories)
                 {
                     try
                     {
@@ -225,7 +246,7 @@ public class FilesystemController : WebApiController
                     catch { /* skip inaccessible entries */ }
                 }
 
-                foreach (var file in Directory.GetFiles(fullPath).OrderBy(f => f))
+                foreach (var file in pageFiles)
                 {
                     try
                     {
@@ -255,7 +276,9 @@ public class FilesystemController : WebApiController
                 currentPath = fullPath,
                 parentPath,
                 directories,
-                files
+                files,
+                totalDirectories,
+                totalFiles
             });
         }
         catch (Exception ex)
@@ -263,6 +286,32 @@ public class FilesystemController : WebApiController
             Logger.Error($"[FilesystemController.Browse] {ex.Message}", ex);
             await SendJson(new { success = false, error = ex.Message }, 500);
         }
+    }
+
+    private bool TryReadPaging(out int offset, out int? limit)
+    {
+        offset = 0;
+        limit = null;
+        string offsetParam = HttpContext.Request.QueryString["offset"];
+        string limitParam = HttpContext.Request.QueryString["limit"];
+
+        if (!string.IsNullOrEmpty(offsetParam)
+            && (!int.TryParse(offsetParam, NumberStyles.None, CultureInfo.InvariantCulture, out offset) || offset < 0))
+        {
+            return false;
+        }
+
+        if (!string.IsNullOrEmpty(limitParam))
+        {
+            if (!int.TryParse(limitParam, NumberStyles.None, CultureInfo.InvariantCulture, out int parsed) || parsed < 1)
+            {
+                return false;
+            }
+
+            limit = parsed;
+        }
+
+        return true;
     }
 
     // -------------------------------------------------------------------------
@@ -353,6 +402,7 @@ public class FilesystemController : WebApiController
     [Route(HttpVerbs.Get, "/filesystem/file")]
     public async Task ReadFile()
     {
+        bool streaming = false;
         try
         {
             string pathParam = HttpContext.Request.QueryString["path"];
@@ -370,7 +420,12 @@ public class FilesystemController : WebApiController
                 return;
             }
 
-            var info = new FileInfo(fullPath);
+            // Opened before any header is set: a file that can't be opened is answered with JSON, which went out
+            // under the file's Content-Length before and left the client waiting for the rest.
+            using var input = new FileStream(
+                fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, StreamBufferSize, useAsync: true);
+            long length = input.Length;
+
             string downloadParam = HttpContext.Request.QueryString["download"];
             bool asAttachment = downloadParam == "1" ||
                 string.Equals(downloadParam, "true", StringComparison.OrdinalIgnoreCase);
@@ -378,22 +433,66 @@ public class FilesystemController : WebApiController
             HttpContext.Response.StatusCode = 200;
             HttpContext.Response.ContentType = GetContentType(fullPath);
             // Content-Length lets the client show real download progress.
-            HttpContext.Response.ContentLength64 = info.Length;
+            HttpContext.Response.ContentLength64 = length;
             HttpContext.Response.Headers["Content-Disposition"] =
-                $"{(asAttachment ? "attachment" : "inline")}; filename=\"{info.Name}\"";
+                $"{(asAttachment ? "attachment" : "inline")}; filename=\"{Path.GetFileName(fullPath)}\"";
 
-            using var input = new FileStream(
-                fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, StreamBufferSize, useAsync: true);
-            await input.CopyToAsync(HttpContext.Response.OutputStream, StreamBufferSize).ConfigureAwait(false);
+            // The connection ends with this response: if the copy fails after the headers, the client sees a closed
+            // connection instead of reading the next response on it as the rest of this body.
+            HttpContext.Response.KeepAlive = false;
+
+            streaming = true;
+            await CopyAnnouncedLengthAsync(input, HttpContext.Response.OutputStream, length).ConfigureAwait(false);
         }
-        catch (UnauthorizedAccessException)
+        catch (UnauthorizedAccessException) when (!streaming)
         {
             await SendJson(new { success = false, error = "Access denied" }, 403);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!streaming)
         {
             Logger.Error($"[FilesystemController.ReadFile] {ex.Message}", ex);
             await SendJson(new { success = false, error = ex.Message }, 500);
+        }
+        catch (Exception ex)
+        {
+            // The headers are out, so no JSON may follow them. Rethrown, so the connection is closed and the client
+            // sees a short body instead of waiting for bytes that never come.
+            if (ex is FileShrankException)
+            {
+                Logger.Warning($"[FilesystemController.ReadFile] {ex.Message}");
+            }
+            else if (ex is IOException or OperationCanceledException)
+            {
+                // usually the client leaving (an aborted download, the app going to the background)
+                Logger.Debug($"[FilesystemController.ReadFile] stopped while sending: {ex.Message}");
+            }
+            else
+            {
+                Logger.Error($"[FilesystemController.ReadFile] failed while sending: {ex.Message}", ex);
+            }
+
+            throw;
+        }
+    }
+
+    private sealed class FileShrankException(string message) : IOException(message);
+
+    // Exactly the length announced in Content-Length: a file that grows meanwhile (the live log) is sent as it was
+    // when the response started; more bytes than announced broke the response and the next one on the connection.
+    private static async Task CopyAnnouncedLengthAsync(Stream input, Stream output, long length)
+    {
+        var buffer = new byte[StreamBufferSize];
+        long left = length;
+        while (left > 0)
+        {
+            int read = await input.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, left))).ConfigureAwait(false);
+            if (read == 0)
+            {
+                throw new FileShrankException($"The file ended {left} bytes before the length that was announced (truncated while it was sent)");
+            }
+
+            await output.WriteAsync(buffer.AsMemory(0, read)).ConfigureAwait(false);
+            left -= read;
         }
     }
 
@@ -564,9 +663,9 @@ public class FilesystemController : WebApiController
                 return;
             }
 
-            if (File.Exists(fullTarget) || Directory.Exists(fullTarget))
+            if (sourceIsDirectory && fullTarget.StartsWith(Path.TrimEndingDirectorySeparator(fullSource) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
             {
-                await SendJson(new { success = false, error = "Target already exists" }, 409);
+                await SendJson(new { success = false, error = "A folder can't be moved into itself" }, 400);
                 return;
             }
 
@@ -577,13 +676,42 @@ public class FilesystemController : WebApiController
                 return;
             }
 
-            if (sourceIsDirectory)
+            if (File.Exists(fullTarget) || Directory.Exists(fullTarget))
             {
-                Directory.Move(fullSource, fullTarget);
+                // On vfat/exFAT (USB sticks, SD cards) a rename that only changes the case finds the source under
+                // the target's name; on ext4 "Foo" and "foo" are two entries, and the target then really exists.
+                if (!IsCaseOnlyRenameOfTheSameEntry(fullSource, fullTarget))
+                {
+                    await SendJson(new { success = false, error = "Target already exists" }, 409);
+                    return;
+                }
+
+                RenameCaseOnly(fullSource, fullTarget, sourceIsDirectory);
+                Logger.Info($"[FilesystemController] Renamed (case only): {fullSource} -> {fullTarget}");
+                await SendJson(new { success = true, path = fullTarget });
+                return;
             }
-            else
+
+            try
             {
-                File.Move(fullSource, fullTarget);
+                if (sourceIsDirectory)
+                {
+                    Directory.Move(fullSource, fullTarget);
+                }
+                else
+                {
+                    // across file systems .NET copies the file and deletes the source
+                    File.Move(fullSource, fullTarget);
+                }
+            }
+            catch (IOException ex) when (sourceIsDirectory
+                && Directory.Exists(fullSource)
+                && !Directory.Exists(fullTarget)
+                && IsCrossDevice(ex, fullSource, targetParent))
+            {
+                // a directory can't be renamed onto another file system (EXDEV); nothing was changed
+                await SendJson(new { success = false, error = "Moving folders between drives is not supported" }, 409);
+                return;
             }
 
             Logger.Info($"[FilesystemController] Renamed: {fullSource} -> {fullTarget}");
@@ -599,6 +727,103 @@ public class FilesystemController : WebApiController
             Logger.Error($"[FilesystemController.Rename] {ex.Message}", ex);
             await SendJson(new { success = false, error = ex.Message }, 500);
         }
+    }
+
+    // The parent's listing has the source but no entry spelled exactly like the target: the target "exists" only
+    // because the file system ignores case.
+    private static bool IsCaseOnlyRenameOfTheSameEntry(string fullSource, string fullTarget)
+    {
+        string parent = Path.GetDirectoryName(fullSource);
+        if (!string.Equals(fullSource, fullTarget, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(parent, Path.GetDirectoryName(fullTarget), StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        string targetName = Path.GetFileName(fullTarget);
+        return !Directory.EnumerateFileSystemEntries(parent)
+            .Any(entry => string.Equals(Path.GetFileName(entry), targetName, StringComparison.Ordinal));
+    }
+
+    // A direct rename that only changes the case is a no-op on vfat/exFAT, so it goes through a temporary name; if
+    // the second step fails, the entry gets its old name back.
+    private static void RenameCaseOnly(string fullSource, string fullTarget, bool isDirectory)
+    {
+        string temporary = Path.Combine(Path.GetDirectoryName(fullSource), $".tns-rename-{Guid.NewGuid():N}");
+        Move(fullSource, temporary, isDirectory);
+
+        try
+        {
+            Move(temporary, fullTarget, isDirectory);
+        }
+        catch (Exception renameError)
+        {
+            try
+            {
+                Move(temporary, fullSource, isDirectory);
+            }
+            catch (Exception rollbackError)
+            {
+                // the entry would otherwise seem gone: it is a hidden file now (Rename logs this message)
+                throw new IOException($"Renaming {fullSource} failed ({renameError.Message}), and so did giving it its name back "
+                    + $"({rollbackError.Message}): it is now {temporary}", renameError);
+            }
+
+            throw;
+        }
+    }
+
+    private static void Move(string from, string to, bool isDirectory)
+    {
+        if (isDirectory)
+        {
+            Directory.Move(from, to);
+        }
+        else
+        {
+            File.Move(from, to);
+        }
+    }
+
+    // EXDEV (18 on Linux and macOS; .NET carries the errno in HResult) also covers a folder behind a symlink to another
+    // drive and btrfs subvolumes. On Unix a move across mounts always fails with EXDEV, so any other error has another
+    // cause; only Windows (HRESULTs) falls back to comparing the drives.
+    private static bool IsCrossDevice(IOException ex, string fullSource, string targetParent)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return ex.HResult == ExdevErrno;
+        }
+
+        return !string.Equals(MountRoot(fullSource), MountRoot(targetParent), StringComparison.Ordinal);
+    }
+
+    // The mount point a path lies on: the longest mounted root that contains it.
+    private static string MountRoot(string path)
+    {
+        string full = Path.GetFullPath(path);
+        string best = Path.GetPathRoot(full) ?? string.Empty;
+
+        try
+        {
+            foreach (var drive in DriveInfo.GetDrives())
+            {
+                string root = Path.TrimEndingDirectorySeparator(drive.RootDirectory.FullName);
+                bool contains = full == root
+                    || full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                    || root == string.Empty;
+                if (contains && root.Length > best.Length)
+                {
+                    best = root;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug($"[FilesystemController] Reading the mounts failed: {ex.Message}");
+        }
+
+        return best;
     }
 
     // -------------------------------------------------------------------------

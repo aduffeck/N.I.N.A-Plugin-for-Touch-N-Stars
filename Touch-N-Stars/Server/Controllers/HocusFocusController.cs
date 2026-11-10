@@ -2090,34 +2090,70 @@ public class HocusFocusController : WebApiController
         }
     }
 
+    // The value of an option POST ({ "value": ... }): the key is required and a JSON null is refused. No HocusFocus
+    // option takes null, and reflection stored a null as 0 or false into number and bool options; any body that
+    // contained "null" somewhere got through before.
+    private static bool TryReadOptionValue(string json, out object value, out string error)
+    {
+        value = null;
+        error = "Value not provided in request body";
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                error = "The request body must be an object with a \"value\"";
+                return false;
+            }
+
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                if (!string.Equals(property.Name, "value", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (property.Value.ValueKind == JsonValueKind.Null)
+                {
+                    error = "The option does not take null";
+                    return false;
+                }
+
+                value = property.Value.Clone();
+                error = null;
+                return true;
+            }
+
+            return false;
+        }
+        catch (JsonException ex)
+        {
+            error = $"Invalid JSON: {ex.Message}";
+            return false;
+        }
+    }
+
     [Route(HttpVerbs.Post, "/hocusfocus/autofocus/options/{optionName}")]
     public async Task<object> SetAutoFocusOption(string optionName)
     {
         try
         {
-            // Parse the request body to get the new value
-            object newValue = null;
-            string jsonStr = null;
+            string jsonStr;
             using (var reader = new System.IO.StreamReader(HttpContext.Request.InputStream))
             {
                 jsonStr = await reader.ReadToEndAsync();
-                Logger.Debug($"[AutoFocus] SetAutoFocusOption {optionName} received: {jsonStr}");
-                if (!string.IsNullOrEmpty(jsonStr))
-                {
-                    var jsonOptions = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-                    // Parse as a simple value wrapper
-                    var valueDict = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object>>(jsonStr, jsonOptions);
-                    if (valueDict != null && valueDict.ContainsKey("value"))
-                    {
-                        newValue = valueDict["value"];
-                    }
-                }
             }
 
-            if (newValue == null && jsonStr != null && !jsonStr.Contains("null"))
+            Logger.Debug($"[AutoFocus] SetAutoFocusOption {optionName} received: {jsonStr}");
+            if (!TryReadOptionValue(jsonStr, out object newValue, out string valueError))
             {
                 HttpContext.Response.StatusCode = 400;
-                return new { Success = false, Error = "Value not provided in request body" };
+                return new { Success = false, Error = valueError };
             }
 
             // Access HocusFocus AutoFocusOptions via reflection
@@ -2829,29 +2865,17 @@ public class HocusFocusController : WebApiController
     {
         try
         {
-            // Parse the request body to get the new value
-            object newValue = null;
-            string jsonStr = null;
+            string jsonStr;
             using (var reader = new System.IO.StreamReader(HttpContext.Request.InputStream))
             {
                 jsonStr = await reader.ReadToEndAsync();
-                Logger.Debug($"[StarDetection] SetStarDetectionOption {optionName} received: {jsonStr}");
-                if (!string.IsNullOrEmpty(jsonStr))
-                {
-                    var jsonOptions = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-                    // Parse as a simple value wrapper
-                    var valueDict = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object>>(jsonStr, jsonOptions);
-                    if (valueDict != null && valueDict.ContainsKey("value"))
-                    {
-                        newValue = valueDict["value"];
-                    }
-                }
             }
 
-            if (newValue == null && jsonStr != null && !jsonStr.Contains("null"))
+            Logger.Debug($"[StarDetection] SetStarDetectionOption {optionName} received: {jsonStr}");
+            if (!TryReadOptionValue(jsonStr, out object newValue, out string valueError))
             {
                 HttpContext.Response.StatusCode = 400;
-                return new { success = false, error = "Value not provided in request body" };
+                return new { success = false, error = valueError };
             }
 
             // Access HocusFocus StarDetectionOptions via reflection
@@ -3098,29 +3122,17 @@ public class HocusFocusController : WebApiController
     {
         try
         {
-            // Parse the request body to get the new value
-            object newValue = null;
-            string jsonStr = null;
+            string jsonStr;
             using (var reader = new System.IO.StreamReader(HttpContext.Request.InputStream))
             {
                 jsonStr = await reader.ReadToEndAsync();
-                Logger.Debug($"[Inspector] SetInspectorOption {optionName} received: {jsonStr}");
-                if (!string.IsNullOrEmpty(jsonStr))
-                {
-                    var jsonOptions = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-                    // Parse as a simple value wrapper
-                    var valueDict = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object>>(jsonStr, jsonOptions);
-                    if (valueDict != null && valueDict.ContainsKey("value"))
-                    {
-                        newValue = valueDict["value"];
-                    }
-                }
             }
 
-            if (newValue == null && jsonStr != null && !jsonStr.Contains("null"))
+            Logger.Debug($"[Inspector] SetInspectorOption {optionName} received: {jsonStr}");
+            if (!TryReadOptionValue(jsonStr, out object newValue, out string valueError))
             {
                 HttpContext.Response.StatusCode = 400;
-                return new { Success = false, Error = "Value not provided in request body" };
+                return new { Success = false, Error = valueError };
             }
 
             // Access HocusFocus InspectorOptions via reflection
@@ -3865,6 +3877,21 @@ public class HocusFocusController : WebApiController
         }
     }
 
+    private static bool TryGetIgnoreCase(JsonElement root, string name, out JsonElement value)
+    {
+        foreach (var property in root.EnumerateObject())
+        {
+            if (string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                value = property.Value;
+                return true;
+            }
+        }
+
+        value = default;
+        return false;
+    }
+
     /// <summary>
     /// Sets the sensor configuration (size and orientation)
     /// </summary>
@@ -3873,43 +3900,131 @@ public class HocusFocusController : WebApiController
     {
         try
         {
-            using var json = JsonDocument.Parse(await HttpContext.GetRequestBodyAsStringAsync());
-            var root = json.RootElement;
-
-            double width = 36.0;
-            double height = 24.0;
-            double rotation = 0.0;
-            double outerRadius = 0.0;
-            double threadPitch = 0.0;
-            int screwCount = 3;
-            bool positiveTurnIsOutward = false;
-
-            if (root.TryGetProperty("sensorWidth", out var widthElement) && widthElement.TryGetDouble(out var widthVal))
-                width = widthVal;
-            if (root.TryGetProperty("sensorHeight", out var heightElement) && heightElement.TryGetDouble(out var heightVal))
-                height = heightVal;
-            if (root.TryGetProperty("sensorRotation", out var rotationElement) && rotationElement.TryGetDouble(out var rotationVal))
-                rotation = Math.Clamp(rotationVal, 0, 359.9);
-            if (root.TryGetProperty("tilterOuterRadius", out var outerRadiusElement) && outerRadiusElement.TryGetDouble(out var outerRadiusVal))
-                outerRadius = outerRadiusVal;
-            if (root.TryGetProperty("tilterThreadPitch", out var threadPitchElement) && threadPitchElement.TryGetDouble(out var threadPitchVal))
-                threadPitch = threadPitchVal;
-            if (root.TryGetProperty("tilterScrewCount", out var screwCountElement) && screwCountElement.TryGetInt32(out var screwCountVal))
-                screwCount = screwCountVal == 4 ? 4 : 3;
-            if (root.TryGetProperty("tilterPositiveTurnIsOutward", out var positiveOutwardElement) &&
-                (positiveOutwardElement.ValueKind == JsonValueKind.True || positiveOutwardElement.ValueKind == JsonValueKind.False))
-                positiveTurnIsOutward = positiveOutwardElement.GetBoolean();
-
-            var config = new TilterService.SensorConfigurationDTO
+            JsonDocument json;
+            try
             {
-                SensorWidth = width,
-                SensorHeight = height,
-                SensorRotation = rotation,
-                TilterOuterRadius = outerRadius,
-                TilterThreadPitch = threadPitch,
-                TilterScrewCount = screwCount,
-                TilterPositiveTurnIsOutward = positiveTurnIsOutward
-            };
+                json = JsonDocument.Parse(await HttpContext.GetRequestBodyAsStringAsync());
+            }
+            catch (JsonException ex)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new Dictionary<string, object>() { { "Success", false }, { "Error", $"Invalid JSON: {ex.Message}" } };
+            }
+
+            using var _ = json;
+            var root = json.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new Dictionary<string, object>() { { "Success", false }, { "Error", "The request body must be an object" } };
+            }
+
+            // Only the fields sent change: a client that sent only the rotation reset the outer radius to 0 and
+            // apply-tilt-plane failed afterwards. Keys in either case (GET answers in PascalCase).
+            var config = TilterService.Instance.GetSensorConfiguration();
+            var invalid = new List<string>();
+            bool any = false;
+
+            if (TryGetIgnoreCase(root, "sensorWidth", out var widthElement))
+            {
+                any = true;
+                if (widthElement.ValueKind == JsonValueKind.Number && widthElement.TryGetDouble(out var widthVal))
+                {
+                    config.SensorWidth = widthVal;
+                }
+                else
+                {
+                    invalid.Add("sensorWidth");
+                }
+            }
+
+            if (TryGetIgnoreCase(root, "sensorHeight", out var heightElement))
+            {
+                any = true;
+                if (heightElement.ValueKind == JsonValueKind.Number && heightElement.TryGetDouble(out var heightVal))
+                {
+                    config.SensorHeight = heightVal;
+                }
+                else
+                {
+                    invalid.Add("sensorHeight");
+                }
+            }
+
+            if (TryGetIgnoreCase(root, "sensorRotation", out var rotationElement))
+            {
+                any = true;
+                if (rotationElement.ValueKind == JsonValueKind.Number && rotationElement.TryGetDouble(out var rotationVal))
+                {
+                    config.SensorRotation = Math.Clamp(rotationVal, 0, 359.9);
+                }
+                else
+                {
+                    invalid.Add("sensorRotation");
+                }
+            }
+
+            if (TryGetIgnoreCase(root, "tilterOuterRadius", out var outerRadiusElement))
+            {
+                any = true;
+                if (outerRadiusElement.ValueKind == JsonValueKind.Number && outerRadiusElement.TryGetDouble(out var outerRadiusVal))
+                {
+                    config.TilterOuterRadius = outerRadiusVal;
+                }
+                else
+                {
+                    invalid.Add("tilterOuterRadius");
+                }
+            }
+
+            if (TryGetIgnoreCase(root, "tilterThreadPitch", out var threadPitchElement))
+            {
+                any = true;
+                if (threadPitchElement.ValueKind == JsonValueKind.Number && threadPitchElement.TryGetDouble(out var threadPitchVal))
+                {
+                    config.TilterThreadPitch = threadPitchVal;
+                }
+                else
+                {
+                    invalid.Add("tilterThreadPitch");
+                }
+            }
+
+            if (TryGetIgnoreCase(root, "tilterScrewCount", out var screwCountElement))
+            {
+                any = true;
+                if (screwCountElement.ValueKind == JsonValueKind.Number && screwCountElement.TryGetInt32(out var screwCountVal))
+                {
+                    config.TilterScrewCount = screwCountVal == 4 ? 4 : 3;
+                }
+                else
+                {
+                    invalid.Add("tilterScrewCount");
+                }
+            }
+
+            if (TryGetIgnoreCase(root, "tilterPositiveTurnIsOutward", out var positiveOutwardElement))
+            {
+                any = true;
+                if (positiveOutwardElement.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                {
+                    config.TilterPositiveTurnIsOutward = positiveOutwardElement.GetBoolean();
+                }
+                else
+                {
+                    invalid.Add("tilterPositiveTurnIsOutward");
+                }
+            }
+
+            if (!any || invalid.Count > 0)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", any ? $"Invalid value for {string.Join(", ", invalid)}" : "No sensor configuration field in the request body" }
+                };
+            }
 
             var tilterService = TilterService.Instance;
             tilterService.SetSensorConfiguration(config);

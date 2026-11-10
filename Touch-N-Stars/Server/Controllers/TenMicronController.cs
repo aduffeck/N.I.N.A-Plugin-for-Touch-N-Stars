@@ -96,14 +96,26 @@ public class TenMicronController : WebApiController
             && GetProp<decimal>(cached, "ErrorArcseconds") == GetProp<decimal>(fromMount, "ErrorArcseconds");
     }
 
-    private static object CallMethod(object obj, string name, object[] args = null)
+    /// <summary>
+    /// Calls a public method of the 10micron plugin. A method that isn't there (another plugin version) throws unless
+    /// <paramref name="required"/> is false: a toggle reported the new state although nothing was called. Null for a
+    /// null object or a void method.
+    /// </summary>
+    private static object CallMethod(object obj, string name, object[] args = null, bool required = true)
     {
         if (obj == null) return null;
+        var method = obj.GetType().GetMethod(name,
+            BindingFlags.Public | BindingFlags.Instance);
+        if (method == null)
+        {
+            if (required)
+                throw new MissingMethodException($"The 10micron plugin has no method {name} (plugin version?)");
+            return null;
+        }
+
         try
         {
-            var method = obj.GetType().GetMethod(name,
-                BindingFlags.Public | BindingFlags.Instance);
-            return method?.Invoke(obj, args ?? Array.Empty<object>());
+            return method.Invoke(obj, args ?? Array.Empty<object>());
         }
         catch (TargetInvocationException tie)
         {
@@ -113,11 +125,64 @@ public class TenMicronController : WebApiController
 
     private static void InvokeICommand(object obj, string propName)
     {
-        var cmd = GetProp<object>(obj, propName);
-        if (cmd == null) return;
+        if (obj == null) return;
+        var cmd = GetProp<object>(obj, propName)
+            ?? throw new MissingMemberException($"The 10micron plugin has no command {propName} (plugin version?)");
         var execute = cmd.GetType().GetMethod("Execute",
-            BindingFlags.Public | BindingFlags.Instance);
-        execute?.Invoke(cmd, new object[] { null });
+            BindingFlags.Public | BindingFlags.Instance)
+            ?? throw new MissingMethodException($"The 10micron command {propName} can't be executed (plugin version?)");
+        try
+        {
+            execute.Invoke(cmd, new object[] { null });
+        }
+        catch (TargetInvocationException tie)
+        {
+            throw tie.InnerException ?? tie;
+        }
+    }
+
+    // TryGetDouble/TryGetInt32 throw for a value that isn't a number (a string, null): false instead
+    private static bool TryGetNumber(System.Text.Json.JsonElement element, out double value)
+    {
+        value = 0;
+        return element.ValueKind == System.Text.Json.JsonValueKind.Number && element.TryGetDouble(out value);
+    }
+
+    private static bool TryGetWhole(System.Text.Json.JsonElement element, out int value)
+    {
+        value = 0;
+        return element.ValueKind == System.Text.Json.JsonValueKind.Number && element.TryGetInt32(out value);
+    }
+
+    // The plugin's toggle setters return nothing: they skip a disconnected mount and catch the mount's errors
+    // themselves, so the result is the state read back afterwards.
+    private static bool IsMountConnected(object mountVM)
+    {
+        var mountInfo = GetProp<object>(mountVM, "MountInfo");
+        return mountInfo != null && GetProp<bool>(mountInfo, "Connected");
+    }
+
+    // { "enabled": true|false }; missing or not a bool is an error (it switched the option off before)
+    private static bool TryReadEnabled(string body, out bool enabled, out string error)
+    {
+        enabled = false;
+        error = "Body must be { \"enabled\": true|false }";
+        if (string.IsNullOrWhiteSpace(body)) return false;
+        try
+        {
+            using var json = System.Text.Json.JsonDocument.Parse(body);
+            if (json.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object
+                || !json.RootElement.TryGetProperty("enabled", out var el)
+                || el.ValueKind is not (System.Text.Json.JsonValueKind.True or System.Text.Json.JsonValueKind.False))
+                return false;
+            enabled = el.GetBoolean();
+            error = null;
+            return true;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -147,7 +212,12 @@ public class TenMicronController : WebApiController
                 BindingFlags.Public | BindingFlags.Instance);
             return method?.Invoke(commander, new object[] { command, true }) as string;
         }
-        catch { return null; }
+        catch (Exception ex)
+        {
+            // reads for the status and time views: a mount that is down answers every one of them with an error
+            Logger.Debug($"TenMicron raw command {command} failed: {(ex as TargetInvocationException)?.InnerException?.Message ?? ex.Message}");
+            return null;
+        }
     }
 
     /// <summary>
@@ -174,7 +244,11 @@ public class TenMicronController : WebApiController
             var result = method?.Invoke(commander, new object[] { command, true });
             return result is bool b && b;
         }
-        catch { return false; }
+        catch (Exception ex)
+        {
+            Logger.Warning($"TenMicron raw command {command} failed: {(ex as TargetInvocationException)?.InnerException?.Message ?? ex.Message}");
+            return false;
+        }
     }
 
     /// <summary>
@@ -284,7 +358,7 @@ public class TenMicronController : WebApiController
             }
 
             var modelMediator = GetMountModelMediator();
-            var info = CallMethod(modelMediator, "GetInfo");
+            var info = CallMethod(modelMediator, "GetInfo", required: false);
             bool connected = info != null && GetProp<bool>(info, "Connected");
 
             var builderMediator = GetBuilderMediator();
@@ -434,11 +508,7 @@ public class TenMicronController : WebApiController
             // running (e.g. right after a model build completes via FinishAlignmentSpec).
             if (vmHandler != null)
             {
-                var ct = CancellationToken.None;
-                var ctsField = vmHandler.GetType().GetField("disconnectCts",
-                    BindingFlags.NonPublic | BindingFlags.Instance);
-                var cts = ctsField?.GetValue(vmHandler) as System.Threading.CancellationTokenSource;
-                if (cts != null) ct = cts.Token;
+                var ct = DisconnectToken(vmHandler);
 
                 var getLoadedMethod = vmHandler.GetType().GetMethod("GetLoadedAlignmentModel",
                     BindingFlags.Public | BindingFlags.Instance);
@@ -450,7 +520,7 @@ public class TenMicronController : WebApiController
                 }
             }
 
-            var info = CallMethod(modelMediator, "GetInfo");
+            var info = CallMethod(modelMediator, "GetInfo", required: false);
             var loadedModel = info != null ? GetProp<object>(info, "LoadedAlignmentModel") : null;
             var modelLoaded = vmHandler != null && GetProp<bool>(vmHandler, "ModelLoaded");
 
@@ -524,11 +594,7 @@ public class TenMicronController : WebApiController
             // Trigger a fresh load from the mount via the private LoadModelNames method
             if (vmHandler != null)
             {
-                var ct = CancellationToken.None;
-                var ctsField = vmHandler.GetType().GetField("disconnectCts",
-                    BindingFlags.NonPublic | BindingFlags.Instance);
-                var cts = ctsField?.GetValue(vmHandler) as System.Threading.CancellationTokenSource;
-                if (cts != null) ct = cts.Token;
+                var ct = DisconnectToken(vmHandler);
 
                 var loadMethod = vmHandler.GetType().GetMethod("LoadModelNames",
                     BindingFlags.NonPublic | BindingFlags.Instance);
@@ -567,20 +633,22 @@ public class TenMicronController : WebApiController
         try
         {
             var body = await HttpContext.GetRequestBodyAsStringAsync();
-            bool enabled = false;
-            if (!string.IsNullOrWhiteSpace(body))
-            {
-                var json = System.Text.Json.JsonDocument.Parse(body);
-                if (json.RootElement.TryGetProperty("enabled", out var el))
-                    enabled = el.GetBoolean();
-            }
+            if (!TryReadEnabled(body, out bool enabled, out string bodyError))
+                return Error(bodyError, 400);
 
             var mountVMMediator = GetMountVMMediator();
             var mountVM = GetMediatorHandler(mountVMMediator);
             if (mountVM == null)
                 return Error("Mount VM not available");
 
+            if (!IsMountConnected(mountVM))
+                return Error("Mount not connected", 409);
+
             CallMethod(mountVM, "SetDualAxisTracking", new object[] { enabled });
+
+            // the plugin writes the value only when the mount acknowledged the change
+            if (GetProp<bool>(GetProp<object>(mountVM, "MountInfo"), "DualAxisTrackingEnabled") != enabled)
+                return Error($"The mount did not switch dual axis tracking {(enabled ? "on" : "off")}");
 
             return new Dictionary<string, object>
             {
@@ -605,20 +673,22 @@ public class TenMicronController : WebApiController
         try
         {
             var body = await HttpContext.GetRequestBodyAsStringAsync();
-            bool enabled = false;
-            if (!string.IsNullOrWhiteSpace(body))
-            {
-                var json = System.Text.Json.JsonDocument.Parse(body);
-                if (json.RootElement.TryGetProperty("enabled", out var el))
-                    enabled = el.GetBoolean();
-            }
+            if (!TryReadEnabled(body, out bool enabled, out string bodyError))
+                return Error(bodyError, 400);
 
             var mountVMMediator = GetMountVMMediator();
             var mountVM = GetMediatorHandler(mountVMMediator);
             if (mountVM == null)
                 return Error("Mount VM not available");
 
+            if (!IsMountConnected(mountVM))
+                return Error("Mount not connected", 409);
+
             CallMethod(mountVM, "SetRefactionCorrectionEnabled", new object[] { enabled });
+
+            // the plugin writes the value only when the mount acknowledged the change
+            if (GetProp<bool>(GetProp<object>(mountVM, "MountInfo"), "RefractionCorrectionEnabled") != enabled)
+                return Error($"The mount did not switch refraction correction {(enabled ? "on" : "off")}");
 
             return new Dictionary<string, object>
             {
@@ -647,7 +717,15 @@ public class TenMicronController : WebApiController
             if (mountVM == null)
                 return Error("Mount VM not available");
 
+            if (!IsMountConnected(mountVM))
+                return Error("Mount not connected", 409);
+
             CallMethod(mountVM, "DisableUnattendedFlip");
+
+            // The VM's own flag (MountInfo's follows with the next poll). The plugin sends the command blind, without an
+            // answer from the mount, so this only shows that it could be sent, or that the flip was off already.
+            if (GetProp<bool>(mountVM, "UnattendedFlipEnabled"))
+                return Error("The command to disable unattended flip could not be sent");
 
             return new Dictionary<string, object>
             {
@@ -888,20 +966,37 @@ public class TenMicronController : WebApiController
 
     // ── builder options ────────────────────────────────────────────────────────
 
-    private static void SetProp(object obj, string name, object value)
+    // Why the option could not be set, with the HTTP status, or null when it was. Everything used to be swallowed
+    // and answered "Success": a missing option, a value of the wrong type and the setters' own range checks
+    // (MinPointAltitude outside 0–90 throws).
+    private static (int Status, string Message)? SetProp(object obj, string name, object value)
     {
-        if (obj == null) return;
+        if (obj == null) return (503, "Options not available");
+        var prop = obj.GetType().GetProperty(name,
+            BindingFlags.Public | BindingFlags.Instance);
+        if (prop == null || !prop.CanWrite)
+            return (500, $"The 10micron plugin has no writable option {name} (plugin version?)");
+
+        object converted;
         try
         {
-            var prop = obj.GetType().GetProperty(name,
-                BindingFlags.Public | BindingFlags.Instance);
-            if (prop == null || !prop.CanWrite) return;
-            // Convert value type if needed (e.g. JsonElement → int/double/bool)
-            var target = prop.PropertyType;
-            object converted = Convert.ChangeType(value, target);
-            prop.SetValue(obj, converted);
+            // Convert value type if needed (e.g. double → int, rounding as before)
+            converted = Convert.ChangeType(value, prop.PropertyType, System.Globalization.CultureInfo.InvariantCulture);
         }
-        catch { /* ignore */ }
+        catch (Exception ex) when (ex is InvalidCastException or FormatException or OverflowException)
+        {
+            return (400, $"Invalid value for {name}: {ex.Message}");
+        }
+
+        try
+        {
+            prop.SetValue(obj, converted);
+            return null;
+        }
+        catch (TargetInvocationException tie) when (tie.InnerException is ArgumentException or InvalidOperationException)
+        {
+            return (400, tie.InnerException.Message);
+        }
     }
 
     /// <summary>GET /tenmicron/builder-options — returns all point-generation options</summary>
@@ -968,7 +1063,14 @@ public class TenMicronController : WebApiController
             if (!string.IsNullOrWhiteSpace(body))
             {
                 var json = System.Text.Json.JsonDocument.Parse(body);
-                if (json.RootElement.TryGetProperty("key", out var k)) key = k.GetString();
+                if (json.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+                    return Error("Body must be { key, value }", 400);
+                if (json.RootElement.TryGetProperty("key", out var k))
+                {
+                    if (k.ValueKind != System.Text.Json.JsonValueKind.String)
+                        return Error("key must be an option name", 400);
+                    key = k.GetString();
+                }
                 if (json.RootElement.TryGetProperty("value", out var v))
                 {
                     value = v.ValueKind switch
@@ -976,12 +1078,13 @@ public class TenMicronController : WebApiController
                         System.Text.Json.JsonValueKind.True => (object)true,
                         System.Text.Json.JsonValueKind.False => (object)false,
                         System.Text.Json.JsonValueKind.Number => v.TryGetDouble(out var d) ? d : (object)v.GetInt32(),
-                        _ => v.GetString()
+                        System.Text.Json.JsonValueKind.String => v.GetString(),
+                        _ => null
                     };
                 }
             }
             if (string.IsNullOrEmpty(key) || value == null)
-                return Error("key and value are required", 400);
+                return Error("key and a value (number, bool or string) are required", 400);
 
             // Map friendly key names to C# property names
             var propMap = new Dictionary<string, string>
@@ -1022,8 +1125,19 @@ public class TenMicronController : WebApiController
             if (opts == null)
                 return Error("Options not available", 503);
 
-            SetProp(opts, propName, value);
-            return new Dictionary<string, object> { { "Success", true } };
+            if (SetProp(opts, propName, value) is { } failure)
+                return Error(failure.Message, failure.Status);
+
+            // some setters clamp: the value the option holds now
+            return new Dictionary<string, object>
+            {
+                { "Success", true },
+                { "Value", opts.GetType().GetProperty(propName)?.GetValue(opts) }
+            };
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            return Error($"Invalid JSON: {ex.Message}", 400);
         }
         catch (Exception ex)
         {
@@ -1098,13 +1212,12 @@ public class TenMicronController : WebApiController
             int starCount = 30;
             if (!string.IsNullOrWhiteSpace(body))
             {
-                try
-                {
-                    var json = System.Text.Json.JsonDocument.Parse(body);
-                    if (json.RootElement.TryGetProperty("starCount", out var sc))
-                        starCount = sc.GetInt32();
-                }
-                catch { /* use default */ }
+                // a starCount that can't be read was replaced by 30 without a word
+                using var json = System.Text.Json.JsonDocument.Parse(body);
+                if (json.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+                    return Error("Body must be { starCount }", 400);
+                if (json.RootElement.TryGetProperty("starCount", out var sc) && !TryGetWhole(sc, out starCount))
+                    return Error("starCount must be a whole number", 400);
             }
 
             var builderMediator = GetBuilderMediator();
@@ -1120,6 +1233,10 @@ public class TenMicronController : WebApiController
                 { "Message",    $"Generated {count} points" },
                 { "PointCount", count }
             };
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            return Error($"Invalid JSON: {ex.Message}", 400);
         }
         catch (Exception ex)
         {
@@ -1140,21 +1257,35 @@ public class TenMicronController : WebApiController
             string startProvider = "Nautical Dusk", endProvider = "Nautical Dawn";
             int startOffset = 0, endOffset = 0;
 
-            if (!string.IsNullOrWhiteSpace(body))
+            // ra and dec are required and every field is checked on its own: an unreadable body or field (e.g. an RA
+            // the app could not parse, sent as null) made a path at RA 0 / Dec 0 or reset the fields after it
+            if (string.IsNullOrWhiteSpace(body))
+                return Error("ra and dec are required", 400);
+            using (var json = System.Text.Json.JsonDocument.Parse(body))
             {
-                try
+                var root = json.RootElement;
+                if (root.ValueKind != System.Text.Json.JsonValueKind.Object)
+                    return Error("Body must be { ra, dec, ... }", 400);
+                if (!root.TryGetProperty("ra", out var raEl) || !TryGetNumber(raEl, out ra))
+                    return Error("ra (hours) is required and must be a number", 400);
+                if (!root.TryGetProperty("dec", out var decEl) || !TryGetNumber(decEl, out dec))
+                    return Error("dec (degrees) is required and must be a number", 400);
+                if (root.TryGetProperty("raDelta", out var rdEl) && !TryGetNumber(rdEl, out raDelta))
+                    return Error("raDelta must be a number", 400);
+                if (root.TryGetProperty("startProvider", out var spEl))
                 {
-                    var json = System.Text.Json.JsonDocument.Parse(body);
-                    var root = json.RootElement;
-                    if (root.TryGetProperty("ra", out var raEl)) ra = raEl.GetDouble();
-                    if (root.TryGetProperty("dec", out var decEl)) dec = decEl.GetDouble();
-                    if (root.TryGetProperty("raDelta", out var rdEl)) raDelta = rdEl.GetDouble();
-                    if (root.TryGetProperty("startProvider", out var spEl)) startProvider = spEl.GetString();
-                    if (root.TryGetProperty("endProvider", out var epEl)) endProvider = epEl.GetString();
-                    if (root.TryGetProperty("startOffset", out var soEl)) startOffset = soEl.GetInt32();
-                    if (root.TryGetProperty("endOffset", out var eoEl)) endOffset = eoEl.GetInt32();
+                    if (spEl.ValueKind != System.Text.Json.JsonValueKind.String) return Error("startProvider must be a name", 400);
+                    startProvider = spEl.GetString();
                 }
-                catch { /* use defaults */ }
+                if (root.TryGetProperty("endProvider", out var epEl))
+                {
+                    if (epEl.ValueKind != System.Text.Json.JsonValueKind.String) return Error("endProvider must be a name", 400);
+                    endProvider = epEl.GetString();
+                }
+                if (root.TryGetProperty("startOffset", out var soEl) && !TryGetWhole(soEl, out startOffset))
+                    return Error("startOffset must be whole minutes", 400);
+                if (root.TryGetProperty("endOffset", out var eoEl) && !TryGetWhole(eoEl, out endOffset))
+                    return Error("endOffset must be whole minutes", 400);
             }
 
             var builderMediator = GetBuilderMediator();
@@ -1216,6 +1347,10 @@ public class TenMicronController : WebApiController
                 { "Message",    $"Generated {count} sidereal path points" },
                 { "PointCount", count }
             };
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            return Error($"Invalid JSON: {ex.Message}", 400);
         }
         catch (Exception ex)
         {
@@ -1447,17 +1582,40 @@ public class TenMicronController : WebApiController
             if (string.IsNullOrWhiteSpace(name))
                 return Error("Model 'name' is required", 400);
 
-            var modelMediator = GetMountModelMediator();
-            var result = CallMethod(modelMediator, "LoadModel", new object[] { name });
-            bool ok = result is bool b && b;
-            if (!ok)
-                return Error($"Failed to load model '{name}'");
+            if (!ModelEditGate.Wait(0))
+                return Error("Another change of the alignment model is running", 409);
 
-            return new Dictionary<string, object>
+            bool releaseNow = true;
+            try
             {
-                { "Success", true },
-                { "Message", $"Model '{name}' loaded" }
-            };
+                var modelMediator = GetMountModelMediator();
+                var result = CallMethod(modelMediator, "LoadModel", new object[] { name });
+                bool ok = result is bool b && b;
+                if (!ok)
+                    return Error($"Failed to load model '{name}'");
+
+                // The plugin reads the loaded model from the mount in the background: the gate is held until that is
+                // done, so a clear-alignment meanwhile doesn't clear the model while it is filled.
+                var vmHandler = GetMediatorHandler(modelMediator);
+                var loadField = vmHandler?.GetType().GetField("alignmentModelLoadTask",
+                    BindingFlags.NonPublic | BindingFlags.Instance);
+                if (loadField?.GetValue(vmHandler) is Task reading && !reading.IsCompleted)
+                {
+                    releaseNow = false;
+                    _ = reading.ContinueWith(_ => ModelEditGate.Release(), TaskScheduler.Default);
+                }
+
+                return new Dictionary<string, object>
+                {
+                    { "Success", true },
+                    { "Message", $"Model '{name}' loaded" }
+                };
+            }
+            finally
+            {
+                if (releaseNow)
+                    ModelEditGate.Release();
+            }
         }
         catch (Exception ex)
         {
@@ -1528,111 +1686,203 @@ public class TenMicronController : WebApiController
 
     // ── alignment star management ──────────────────────────────────────────────
 
-    /// <summary>POST /tenmicron/delete-worst-star</summary>
+    // Load-model, delete-worst-star and clear-alignment one at a time (EmbedIO makes a controller per request): a second
+    // delete-worst-star while one runs would delete another star. Load and delete hold it until the plugin has read
+    // the model from the mount again.
+    private static readonly SemaphoreSlim ModelEditGate = new(1, 1);
+
+    private static CancellationToken DisconnectToken(object vmHandler)
+    {
+        var ctsField = vmHandler?.GetType().GetField("disconnectCts",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        return ctsField?.GetValue(vmHandler) is CancellationTokenSource cts ? cts.Token : CancellationToken.None;
+    }
+
+    // Reloads the model in the background after a change, as the plugin's own delete does (ModelLoaded = false; _ =
+    // LoadAlignmentModel(...)); GET alignment-model waits for that load. The load's task, or why it didn't start.
+    private static (Task Load, string Warning) StartModelReload(object vmHandler)
+    {
+        // the token read now: one read before the change may be from before a disconnect and reconnect
+        var ct = DisconnectToken(vmHandler);
+        if (!IsMountVMConnected(vmHandler) || ct.IsCancellationRequested)
+            return (null, "The mount is not connected; the model is read again on the next connect");
+
+        var loadMethod = vmHandler.GetType().GetMethod("LoadAlignmentModel",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        if (loadMethod == null)
+            return (null, "The model could not be read again (plugin version?)");
+
+        try
+        {
+            vmHandler.GetType().GetProperty("ModelLoaded", BindingFlags.Public | BindingFlags.Instance)?.SetValue(vmHandler, false);
+            if (loadMethod.Invoke(vmHandler, new object[] { ct }) is not Task load)
+                return (null, null);
+
+            _ = load.ContinueWith(
+                t => Logger.Warning($"TenMicron: reading the model again after the change failed: {t.Exception?.GetBaseException().Message}"),
+                TaskContinuationOptions.OnlyOnFaulted);
+            return (load, null);
+        }
+        catch (Exception ex)
+        {
+            var reason = (ex as TargetInvocationException)?.InnerException?.Message ?? ex.Message;
+            Logger.Warning($"TenMicron: reading the model again after the change failed: {reason}");
+            return (null, $"The model could not be read again: {reason}");
+        }
+    }
+
+    /// <summary>
+    /// POST /tenmicron/delete-worst-star, body optional: { expectedIndex, expectedErrorArcsec } — with them the star is
+    /// deleted only while it is still the worst one the client showed, so a retry can't delete a second star.
+    /// </summary>
     [Route(HttpVerbs.Post, "/tenmicron/delete-worst-star")]
     public async Task<object> DeleteWorstStar()
     {
         if (!IsPluginLoaded()) return PluginNotLoaded();
         try
         {
+            int? expectedIndex = null;
+            double? expectedError = null;
+            var body = await HttpContext.GetRequestBodyAsStringAsync().ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(body))
+            {
+                using var json = System.Text.Json.JsonDocument.Parse(body);
+                if (json.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object)
+                {
+                    if (json.RootElement.TryGetProperty("expectedIndex", out var ei))
+                    {
+                        if (!TryGetWhole(ei, out int index)) return Error("expectedIndex must be a whole number", 400);
+                        expectedIndex = index;
+                    }
+                    if (json.RootElement.TryGetProperty("expectedErrorArcsec", out var ee))
+                    {
+                        if (!TryGetNumber(ee, out double errorArcsec)) return Error("expectedErrorArcsec must be a number", 400);
+                        expectedError = errorArcsec;
+                    }
+                }
+            }
+
             var modelMediator = GetMountModelMediator();
             var vmHandler = GetMediatorHandler(modelMediator);
-            var ct = CancellationToken.None;
-            if (vmHandler != null)
-            {
-                var ctsField = vmHandler.GetType().GetField("disconnectCts",
-                    BindingFlags.NonPublic | BindingFlags.Instance);
-                if (ctsField?.GetValue(vmHandler) is CancellationTokenSource cts) ct = cts.Token;
-            }
+            if (!IsMountVMConnected(vmHandler))
+                return Error("Mount not connected", 409);
 
-            // Pick the worst star from the model the plugin already holds, like the WPF
-            // DeleteWorstStar does. Reading all stars from the mount again costs one round
-            // trip per star, and the reload after the delete reads them all once more.
-            double maxError = double.MinValue;
-            int worstIndex = -1;
-            var cachedStars = await GetCachedAlignmentStars(vmHandler, ct).ConfigureAwait(false);
-            if (cachedStars != null)
+            if (!await ModelEditGate.WaitAsync(0).ConfigureAwait(false))
+                return Error("Another change of the alignment model is running", 409);
+
+            // held until the reload after the delete is done: a load-model or clear-alignment meanwhile would join
+            // that reload of the old model or clear it while it is read
+            bool releaseNow = true;
+            try
             {
-                for (int i = 0; i < cachedStars.Count; i++)
+                var ct = DisconnectToken(vmHandler);
+
+                // Pick the worst star from the model the plugin already holds, like the WPF
+                // DeleteWorstStar does. Reading all stars from the mount again costs one round
+                // trip per star, and the reload after the delete reads them all once more.
+                double maxError = double.MinValue;
+                int worstIndex = -1;
+                var cachedStars = await GetCachedAlignmentStars(vmHandler, ct).ConfigureAwait(false);
+                if (cachedStars != null)
                 {
-                    double err = (double)GetProp<decimal>(cachedStars[i], "ErrorArcseconds");
-                    if (err > maxError)
+                    for (int i = 0; i < cachedStars.Count; i++)
                     {
-                        maxError = err;
-                        worstIndex = i + 1;
+                        double err = (double)GetProp<decimal>(cachedStars[i], "ErrorArcseconds");
+                        if (err > maxError)
+                        {
+                            maxError = err;
+                            worstIndex = i + 1;
+                        }
+                    }
+
+                    // The cache is indexed by list position, which only equals the mount index if no
+                    // star was skipped while loading. Confirm with a single read before deleting.
+                    if (worstIndex > 0)
+                    {
+                        object mountStar = null;
+                        try
+                        {
+                            mountStar = CallMethod(modelMediator, "GetAlignmentStarInfo", new object[] { worstIndex });
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warning($"TenMicron DeleteWorstStar: failed to read star {worstIndex} from the mount: {ex.Message}");
+                        }
+                        if (!SameAlignmentStar(cachedStars[worstIndex - 1], mountStar))
+                        {
+                            Logger.Info($"TenMicron DeleteWorstStar: cached star {worstIndex} does not match the mount, scanning all stars");
+                            maxError = double.MinValue;
+                            worstIndex = -1;
+                        }
                     }
                 }
 
-                // The cache is indexed by list position, which only equals the mount index if no
-                // star was skipped while loading. Confirm with a single read before deleting.
-                if (worstIndex > 0)
+                if (worstIndex < 0)
                 {
-                    object mountStar = null;
-                    try
+                    int starCount = (int)(CallMethod(modelMediator, "GetAlignmentStarCount") ?? 0);
+                    if (starCount == 0)
+                        return Error("No alignment stars to delete", 400);
+
+                    for (int i = 1; i <= starCount; i++)
                     {
-                        mountStar = CallMethod(modelMediator, "GetAlignmentStarInfo", new object[] { worstIndex });
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Warning($"TenMicron DeleteWorstStar: failed to read star {worstIndex} from the mount: {ex.Message}");
-                    }
-                    if (!SameAlignmentStar(cachedStars[worstIndex - 1], mountStar))
-                    {
-                        Logger.Info($"TenMicron DeleteWorstStar: cached star {worstIndex} does not match the mount, scanning all stars");
-                        maxError = double.MinValue;
-                        worstIndex = -1;
+                        var starInfo = CallMethod(modelMediator, "GetAlignmentStarInfo", new object[] { i });
+                        if (starInfo == null) continue;
+                        double err = (double)GetProp<decimal>(starInfo, "ErrorArcseconds");
+                        if (err > maxError)
+                        {
+                            maxError = err;
+                            worstIndex = i;
+                        }
                     }
                 }
-            }
 
-            if (worstIndex < 0)
-            {
-                int starCount = (int)(CallMethod(modelMediator, "GetAlignmentStarCount") ?? 0);
-                if (starCount == 0)
-                    return Error("No alignment stars to delete", 400);
+                if (worstIndex < 0)
+                    return Error("Could not determine worst star");
 
-                for (int i = 1; i <= starCount; i++)
+                // the client shows the error rounded to two decimals (plus float noise at the rounding edge)
+                if ((expectedIndex is { } wantedIndex && wantedIndex != worstIndex)
+                    || (expectedError is { } wantedError && Math.Abs(wantedError - maxError) > 0.0051))
                 {
-                    var starInfo = CallMethod(modelMediator, "GetAlignmentStarInfo", new object[] { i });
-                    if (starInfo == null) continue;
-                    double err = (double)GetProp<decimal>(starInfo, "ErrorArcseconds");
-                    if (err > maxError)
-                    {
-                        maxError = err;
-                        worstIndex = i;
-                    }
+                    return Error($"The worst star is now star {worstIndex} ({maxError:0.##} arcsec), not the one shown; nothing was deleted", 409);
                 }
-            }
 
-            if (worstIndex < 0)
-                return Error("Could not determine worst star");
+                var deleteResult = CallMethod(modelMediator, "DeleteAlignmentStar", new object[] { worstIndex });
+                bool ok = deleteResult is bool b && b;
+                if (!ok)
+                    return Error("Failed to delete worst alignment star");
 
-            var deleteResult = CallMethod(modelMediator, "DeleteAlignmentStar", new object[] { worstIndex });
-            bool ok = deleteResult is bool b && b;
-            if (!ok)
-                return Error("Failed to delete worst alignment star");
+                Logger.Info($"TenMicron DeleteWorstStar: deleted star {worstIndex} ({maxError:0.##} arcsec)");
 
-            // Mirror the WPF flow: trigger a fresh model reload from the mount so the
-            // cache reflects the updated star count and RMS before the next GET.
-            if (vmHandler != null)
-            {
-                var loadMethod = vmHandler.GetType().GetMethod("LoadAlignmentModel",
-                    BindingFlags.NonPublic | BindingFlags.Instance);
-                if (loadMethod != null)
+                // From here on the star is gone: a reload that fails or takes long must not turn this answer into an
+                // error, which the user retries and deletes a second star.
+                var (reload, reloadWarning) = StartModelReload(vmHandler);
+                if (reload != null)
                 {
-                    var loadTask = loadMethod.Invoke(vmHandler, new object[] { ct }) as Task;
-                    if (loadTask != null)
-                        await loadTask.ConfigureAwait(false);
+                    releaseNow = false;
+                    _ = reload.ContinueWith(_ => ModelEditGate.Release(), TaskScheduler.Default);
                 }
-            }
 
-            return new Dictionary<string, object>
+                var response = new Dictionary<string, object>
+                {
+                    { "Success", true },
+                    { "Message", $"Deleted star {worstIndex} with error {maxError:0.##} arcsec" },
+                    { "DeletedStarIndex", worstIndex },
+                    { "DeletedErrorArcsec", Math.Round(maxError, 2) }
+                };
+                if (reloadWarning != null)
+                    response["Warning"] = reloadWarning;
+
+                return response;
+            }
+            finally
             {
-                { "Success", true },
-                { "Message", $"Deleted star {worstIndex} with error {maxError:0.##} arcsec" },
-                { "DeletedStarIndex", worstIndex },
-                { "DeletedErrorArcsec", Math.Round(maxError, 2) }
-            };
+                if (releaseNow)
+                    ModelEditGate.Release();
+            }
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            return Error($"Invalid JSON: {ex.Message}", 400);
         }
         catch (Exception ex)
         {
@@ -1656,11 +1906,7 @@ public class TenMicronController : WebApiController
 
             if (vmHandler != null)
             {
-                var ct = CancellationToken.None;
-                var ctsField = vmHandler.GetType().GetField("disconnectCts",
-                    BindingFlags.NonPublic | BindingFlags.Instance);
-                var cts = ctsField?.GetValue(vmHandler) as CancellationTokenSource;
-                if (cts != null) ct = cts.Token;
+                var ct = DisconnectToken(vmHandler);
 
                 var loadMethod = vmHandler.GetType().GetMethod("LoadAlignmentModel",
                     BindingFlags.NonPublic | BindingFlags.Instance);
@@ -1672,7 +1918,7 @@ public class TenMicronController : WebApiController
                 }
             }
 
-            var info = CallMethod(modelMediator, "GetInfo");
+            var info = CallMethod(modelMediator, "GetInfo", required: false);
             var loadedModel = info != null ? GetProp<object>(info, "LoadedAlignmentModel") : null;
             var modelLoaded = vmHandler != null && GetProp<bool>(vmHandler, "ModelLoaded");
 
@@ -1728,13 +1974,22 @@ public class TenMicronController : WebApiController
         if (!IsPluginLoaded()) return PluginNotLoaded();
         try
         {
-            var modelMediator = GetMountModelMediator();
-            CallMethod(modelMediator, "DeleteAlignment");
-            return new Dictionary<string, object>
+            if (!ModelEditGate.Wait(0))
+                return Error("Another change of the alignment model is running", 409);
+            try
             {
-                { "Success", true },
-                { "Message", "Alignment cleared" }
-            };
+                var modelMediator = GetMountModelMediator();
+                CallMethod(modelMediator, "DeleteAlignment");
+                return new Dictionary<string, object>
+                {
+                    { "Success", true },
+                    { "Message", "Alignment cleared" }
+                };
+            }
+            finally
+            {
+                ModelEditGate.Release();
+            }
         }
         catch (Exception ex)
         {
@@ -1758,7 +2013,7 @@ public class TenMicronController : WebApiController
                 return Error("Mount VM not available");
 
             var modelMediator = GetMountModelMediator();
-            var info = CallMethod(modelMediator, "GetInfo");
+            var info = CallMethod(modelMediator, "GetInfo", required: false);
             bool connected = info != null && GetProp<bool>(info, "Connected");
             if (!connected)
                 return Error("Mount is not connected", 503);

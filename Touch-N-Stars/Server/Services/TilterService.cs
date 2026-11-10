@@ -645,12 +645,26 @@ public class TilterService
             Settings.Default.TilterThreadPitch = config.TilterThreadPitch;
             Settings.Default.TilterScrewCount = NormalizeScrewCount(config.TilterScrewCount);
             Settings.Default.TilterPositiveTurnIsOutward = config.TilterPositiveTurnIsOutward;
-            CoreUtil.SaveSettings(Settings.Default);
+            // Save directly: CoreUtil.SaveSettings logs a failure and reloads, so the caller answered "updated"
+            Settings.Default.Save();
             Logger.Info($"TilterService: Sensor configuration updated - Width: {config.SensorWidth}mm, Height: {config.SensorHeight}mm, Rotation: {Settings.Default.SensorRotation}°, OuterRadius: {config.TilterOuterRadius}mm, ThreadPitch: {config.TilterThreadPitch}mm, ScrewCount: {Settings.Default.TilterScrewCount}, PositiveTurnIsOutward: {Settings.Default.TilterPositiveTurnIsOutward}");
         }
         catch (Exception ex)
         {
-            Logger.Error($"TilterService: Error setting sensor configuration: {ex.Message}");
+            // the caller logs the failure as an error
+            Logger.Warning($"TilterService: Saving the sensor configuration failed: {ex.Message}");
+
+            // the values in memory are not what is stored
+            try
+            {
+                Settings.Default.Reload();
+            }
+            catch (Exception reloadError)
+            {
+                Logger.Error($"TilterService: Reloading the settings after the failed save failed too: {reloadError.Message}");
+            }
+
+            throw;
         }
     }
 
