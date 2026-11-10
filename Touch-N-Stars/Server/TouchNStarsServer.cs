@@ -127,6 +127,7 @@ namespace TouchNStars.Server {
                 apiToken?.Cancel();
                 foreach (HipsSurveyService survey in HipsSurveyService.All) {
                     survey.CancelDownload();
+                    survey.CancelAllskyBuild();
                 }
                 WebServer?.Dispose();
                 WebServer = null;

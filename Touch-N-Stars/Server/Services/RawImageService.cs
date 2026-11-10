@@ -133,14 +133,15 @@ namespace TouchNStars.Server.Services {
                                                   int maxDim, bool gzip, CancellationToken ct) {
             string path;
             if (!string.IsNullOrWhiteSpace(fileName)) {
-                // GetInvalidFileNameChars() is nearly empty on Linux, and the name doubles as a
-                // search pattern below, so wildcards and path parts are rejected explicitly.
+                // GetInvalidFileNameChars() is nearly empty on Linux, so wildcards and path parts
+                // are rejected explicitly: only a plain name is looked up.
                 if (fileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
                     || fileName.IndexOfAny(new[] { '*', '?', '/', '\\' }) >= 0
                     || fileName.Trim('.').Length == 0) {
                     throw new RawImageException(400, "invalid-filename", "A plain file name is required");
                 }
-                path = ResolveSavedImage(fileName);
+                // a frame from before this session may need a walk of the image folder: off the request thread
+                path = await Task.Run(() => ResolveSavedImage(fileName), ct).ConfigureAwait(false);
             } else if (index.HasValue && mean.HasValue && median.HasValue) {
                 path = ResolveSavedImage(index.Value, mean.Value, median.Value);
             } else {
@@ -271,10 +272,11 @@ namespace TouchNStars.Server.Services {
         private static bool SameStatistic(double a, double b) =>
             Math.Abs(a - b) <= 1e-6 * Math.Max(1.0, Math.Abs(a));
 
+        // File names compare as the file system does (case-sensitive on Linux), here and in the disk index.
         private static string ResolveSavedImage(string fileName) {
             lock (StateLock) {
                 for (var node = savedImages.Last; node != null; node = node.Previous) {
-                    if (string.Equals(Path.GetFileName(node.Value.Path), fileName, StringComparison.OrdinalIgnoreCase)
+                    if (string.Equals(Path.GetFileName(node.Value.Path), fileName, StringComparison.Ordinal)
                         && File.Exists(node.Value.Path)) {
                         return node.Value.Path;
                     }
@@ -285,12 +287,81 @@ namespace TouchNStars.Server.Services {
             // looked up below the configured image folder - never anywhere else on the disk.
             string root = TouchNStars.Mediators.Profile.ActiveProfile.ImageFileSettings.FilePath;
             if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) return null;
-            try {
-                return Directory.EnumerateFiles(root, fileName, SearchOption.AllDirectories).FirstOrDefault();
-            } catch (Exception ex) {
-                Logger.Warning($"[RawImageService] Searching {root} for {fileName} failed: {ex.Message}");
+            return FindOnDisk(root, fileName);
+        }
+
+        // Name -> path of the frames below the image folder, from one walk; of several files with a
+        // name the newest wins (the same name from another night is less likely the one asked for).
+        // Walking the folder for every request read the whole tree from the SD card each time. Only
+        // the formats NINA saves frames in are kept, so a folder with other data costs no memory;
+        // hidden folders (.Trash, a home folder's .local) are skipped.
+        private static readonly HashSet<string> FrameExtensions = new(StringComparer.OrdinalIgnoreCase) {
+            ".fits", ".fit", ".fts", ".fz", ".xisf", ".tif", ".tiff",
+            ".cr2", ".cr3", ".nef", ".raf", ".raw", ".pef", ".dng", ".arw", ".orf", ".rw2",
+            // a gphoto2 camera set to JPEG saves its own files, which the loader opens as well
+            ".jpg", ".jpeg", ".png", ".gif",
+        };
+
+        private sealed class DiskIndex {
+            public string Root;
+            public Dictionary<string, string> Paths;
+            public DateTime BuiltUtc;
+        }
+
+        private static readonly TimeSpan DiskIndexMinRebuildInterval = TimeSpan.FromSeconds(60);
+        private static readonly object DiskIndexLock = new();
+        private static DiskIndex diskIndex;
+
+        // Under the lock, so requests arriving together walk the folder once. A name the index does
+        // not know (or a file deleted since) rebuilds it, at most once a minute: a frame another
+        // program wrote just after a rebuild is found a minute later. A hit is not checked for a
+        // newer file of the same name written since the index was built.
+        private static string FindOnDisk(string root, string fileName) {
+            lock (DiskIndexLock) {
+                DiskIndex index = null;
+                if (diskIndex != null && string.Equals(diskIndex.Root, root, StringComparison.Ordinal)) {
+                    index = diskIndex;
+                }
+
+                if (index != null && index.Paths.TryGetValue(fileName, out string known) && File.Exists(known)) {
+                    return known;
+                }
+
+                if (index != null && DateTime.UtcNow - index.BuiltUtc < DiskIndexMinRebuildInterval) {
+                    return null;
+                }
+
+                index = BuildDiskIndex(root);
+                diskIndex = index;
+                if (index.Paths.TryGetValue(fileName, out string found) && File.Exists(found)) {
+                    return found;
+                }
+
                 return null;
             }
+        }
+
+        private static DiskIndex BuildDiskIndex(string root) {
+            var paths = new Dictionary<string, string>(StringComparer.Ordinal);
+            try {
+                var options = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
+                foreach (string path in Directory.EnumerateFiles(root, "*", options)) {
+                    if (!FrameExtensions.Contains(Path.GetExtension(path))) {
+                        continue;
+                    }
+
+                    string name = Path.GetFileName(path);
+                    // the write times are read only for a name that repeats
+                    if (!paths.TryGetValue(name, out string other)
+                        || File.GetLastWriteTimeUtc(path) > File.GetLastWriteTimeUtc(other)) {
+                        paths[name] = path;
+                    }
+                }
+            } catch (Exception ex) {
+                Logger.Warning($"[RawImageService] Indexing {root} stopped early, the index is incomplete for a minute: {ex.Message}");
+            }
+
+            return new DiskIndex { Root = root, Paths = paths, BuiltUtc = DateTime.UtcNow };
         }
     }
 }

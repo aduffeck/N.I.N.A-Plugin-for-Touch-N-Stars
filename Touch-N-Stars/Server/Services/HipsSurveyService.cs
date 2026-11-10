@@ -77,6 +77,28 @@ public sealed class HipsSurveyService
     private MocCoverage coverage;
     private DownloadJob job;
 
+    // The Allsky preview of a survey that has its base order but no preview (written by an older plugin, or left by
+    // a crashed job) is built in the background: decoding its 768 tiles held up the status request for seconds. The
+    // gate keeps one build at a time, also against the job's own build; a full delete cancels and awaits it. A build
+    // that failed is not retried by every status poll, only after the next start or full delete.
+    private readonly SemaphoreSlim allskyGate = new(1, 1);
+    private Task allskyTask = Task.CompletedTask;
+    private CancellationTokenSource allskyCancellation;
+    private string allskyFailedRoot;
+
+    // A full delete is running: nothing may write into the folder being deleted (the delete then fails with "directory
+    // not empty"), neither a build, a download nor a status poll's reconcile; a status during it reads as not
+    // installed. A downgrade is running: no full delete, start or second downgrade until it is done.
+    private bool deleting;
+    private bool downgrading;
+
+    // A scan, its reconcile and the store into the cache run under the gate, so a delete or downgrade that waits for
+    // it never removes files under a scan or its writes. A scan is cached only when no invalidation (the generation)
+    // and no delete came meanwhile: a scan that started before the job's last order or a delete would otherwise
+    // cache the state before it.
+    private readonly SemaphoreSlim inventoryGate = new(1, 1);
+    private long inventoryGeneration;
+
     /// <param name="definition">Which survey this instance manages.</param>
     /// <param name="sourceUrlOverride">Tile sources for tests; null uses the environment/defaults.</param>
     /// <param name="rootOverride">Survey folder for tests; null uses the persistent data directory.</param>
@@ -263,7 +285,7 @@ public sealed class HipsSurveyService
     public SurveyStatus GetStatus()
     {
         string root = ResolveRoot(createIfMissing: false);
-        SurveyInventory inventory = GetInventory(root);
+        SurveyInventory inventory = GetInventory(root, buildAllsky: true);
         DriveSpace space = GetDriveSpace(root);
         DownloadJob current;
         lock (sync)
@@ -296,8 +318,36 @@ public sealed class HipsSurveyService
             return OperationResult.Fail(400, $"targetOrder must be between {Definition.BaseOrder} and {Definition.MaxOrder}.");
         }
 
+        // before anything touches the disk: a start during a delete would create the folder again and judge the free
+        // space by the half-deleted tree
+        long generation;
+        lock (sync)
+        {
+            // also before the rescan, which would only find out later; in the order of the job lock below
+            if (job != null && job.IsRunning)
+            {
+                return OperationResult.Fail(409, "A survey download is already running.");
+            }
+
+            if (BusyReason() is { } busy)
+            {
+                return OperationResult.Fail(409, busy);
+            }
+
+            generation = inventoryGeneration;
+        }
+
         string root = ResolveRoot(createIfMissing: true);
         SurveyInventory inventory = GetInventory(root, forceRescan: true);
+
+        // a delete or downgrade that began meanwhile: the scan says nothing about the survey any more
+        lock (sync)
+        {
+            if (BusyReason() is { } busy)
+            {
+                return OperationResult.Fail(409, busy);
+            }
+        }
 
         long missingBytes = 0;
         int missingTiles = 0;
@@ -336,6 +386,18 @@ public sealed class HipsSurveyService
                     return OperationResult.Fail(409, "A survey download is already running.");
                 }
 
+                if (BusyReason() is { } busy)
+                {
+                    return OperationResult.Fail(409, busy);
+                }
+
+                // a delete or downgrade ran between the scan and here: the counts and the free space are from before it
+                if (generation != inventoryGeneration)
+                {
+                    return OperationResult.Fail(409, "The survey changed meanwhile; try again.");
+                }
+
+                allskyFailedRoot = null;
                 DownloadJob newJob = new(targetOrder, TileCountUpTo(targetOrder));
                 newJob.TilesDone = inventory.Orders.Where(o => o.Order <= targetOrder).Sum(o => Math.Min(o.TilesPresent, o.TileCount));
                 job = newJob;
@@ -371,6 +433,17 @@ public sealed class HipsSurveyService
         return OperationResult.Ok();
     }
 
+    // Why the survey can't be started or changed now, or null; caller holds sync.
+    private string BusyReason()
+    {
+        if (deleting)
+        {
+            return "The survey is being deleted.";
+        }
+
+        return downgrading ? "The survey is being downgraded." : null;
+    }
+
     /// <param name="keepOrder">
     /// When null, the whole survey is removed. Otherwise only the orders above
     /// <paramref name="keepOrder"/> are removed (e.g. downgrade order 5 back to the base
@@ -379,6 +452,11 @@ public sealed class HipsSurveyService
     /// </param>
     public OperationResult DeleteSurvey(int? keepOrder = null)
     {
+        // before a flag is set: nothing between setting it and the finally that resets it may throw
+        string root = ResolveRoot(createIfMissing: false);
+
+        // the downgrade's generation: a change from here, through its rescan, to its flag lock refuses it
+        long generation = 0;
         lock (sync)
         {
             if (job != null && job.IsRunning)
@@ -386,21 +464,34 @@ public sealed class HipsSurveyService
                 return OperationResult.Fail(409, "Cancel the running survey download first.");
             }
 
-            job = null;
-        }
+            if (BusyReason() is { } busy)
+            {
+                return OperationResult.Fail(409, busy);
+            }
 
-        string root = ResolveRoot(createIfMissing: false);
+            job = null;
+
+            if (keepOrder == null)
+            {
+                deleting = true;
+                inventoryGeneration++;
+            }
+            else
+            {
+                generation = inventoryGeneration;
+            }
+        }
 
         if (keepOrder == null)
         {
-            lock (sync)
-            {
-                cachedInventory = null;
-                coverage = null;
-            }
-
             try
             {
+                CancelAllskyBuild();
+
+                // a scan that began before the flag finishes its reconcile first; later ones read "not installed"
+                inventoryGate.Wait();
+                inventoryGate.Release();
+
                 if (Directory.Exists(root))
                 {
                     Directory.Delete(root, recursive: true);
@@ -414,19 +505,64 @@ public sealed class HipsSurveyService
                 Logger.Error($"{LogPrefix} Delete failed: {ex.Message}");
                 return OperationResult.Fail(500, $"Failed to delete the survey: {ex.Message}");
             }
+            finally
+            {
+                lock (sync)
+                {
+                    cachedInventory = null;
+                    coverage = null;
+                    inventoryGeneration++;
+                    deleting = false;
+                }
+            }
         }
 
+        // A downgrade keeps every order up to keepOrder (at least the base order), and with them the Allsky in
+        // Norder{MinOrder}: a build may go on.
         if (keepOrder.Value < Definition.BaseOrder || keepOrder.Value >= Definition.MaxOrder)
         {
             return OperationResult.Fail(400, $"keepOrder must be between {Definition.BaseOrder} and {Definition.MaxOrder - 1}.");
         }
 
         SurveyInventory inventory = GetInventory(root, forceRescan: true);
+
+        lock (sync)
+        {
+            // a full delete that began meanwhile made the scan read "not installed"
+            if (BusyReason() is { } busy)
+            {
+                return OperationResult.Fail(409, busy);
+            }
+        }
+
         if (inventory.InstalledOrder == null || keepOrder.Value >= inventory.InstalledOrder.Value)
         {
             return OperationResult.Fail(409, $"Order {keepOrder.Value} is not installed above the current order; nothing to delete.");
         }
 
+        lock (sync)
+        {
+            if (BusyReason() is { } busy)
+            {
+                return OperationResult.Fail(409, busy);
+            }
+
+            if (job != null && job.IsRunning)
+            {
+                return OperationResult.Fail(409, "Cancel the running survey download first.");
+            }
+
+            // a delete or downgrade ran between the scan and here
+            if (generation != inventoryGeneration)
+            {
+                return OperationResult.Fail(409, "The survey changed meanwhile; try again.");
+            }
+
+            downgrading = true;
+        }
+
+        // no scan runs while the orders go: a status that needs one waits (the cached one is answered at once)
+        inventoryGate.Wait();
         try
         {
             for (int order = keepOrder.Value + 1; order <= Definition.MaxOrder; order++)
@@ -438,7 +574,6 @@ public sealed class HipsSurveyService
                 }
             }
 
-            InvalidateInventory();
             Logger.Info($"{LogPrefix} Survey downgraded to order {keepOrder.Value} in '{root}'.");
             return OperationResult.Ok();
         }
@@ -446,6 +581,17 @@ public sealed class HipsSurveyService
         {
             Logger.Error($"{LogPrefix} Delete failed: {ex.Message}");
             return OperationResult.Fail(500, $"Failed to delete the survey: {ex.Message}");
+        }
+        finally
+        {
+            InvalidateInventory();
+
+            lock (sync)
+            {
+                downgrading = false;
+            }
+
+            inventoryGate.Release();
         }
     }
 
@@ -478,36 +624,45 @@ public sealed class HipsSurveyService
                         $"{current.FailedInOrder} tiles of order {order} could not be downloaded.");
                 }
 
-                if (order == Definition.MinOrder && !File.Exists(AllskyPath(root)))
+                if (order == Definition.MinOrder)
                 {
-                    await BuildAllskyAsync(root, token).ConfigureAwait(false);
+                    await BuildAllskyOnceAsync(root, token).ConfigureAwait(false);
                 }
 
                 WriteProperties(root, order, sourceUrls[0]);
                 InvalidateInventory();
             }
 
-            current.Finish("completed", null);
+            FinishJob(current, "completed", null);
             Logger.Info($"{LogPrefix} Download to order {current.TargetOrder} completed.");
         }
         catch (OperationCanceledException)
         {
-            current.Finish("cancelled", "Download cancelled.");
+            FinishJob(current, "cancelled", "Download cancelled.");
             Logger.Info($"{LogPrefix} Download cancelled.");
         }
         catch (SurveyDownloadException ex)
         {
-            current.Finish("failed", ex.Message);
+            FinishJob(current, "failed", ex.Message);
             Logger.Warning($"{LogPrefix} Download failed: {ex.Message}");
         }
         catch (Exception ex)
         {
-            current.Finish("failed", ex.Message);
+            FinishJob(current, "failed", ex.Message);
             Logger.Error($"{LogPrefix} Download failed: {ex}");
         }
-        finally
+    }
+
+    // The job's end and the invalidation in one step: a scan sees either the running job with the old generation
+    // (its store is refused) or the finished one with the new (it reconciles), and a start or downgrade right after
+    // the end never sees the generation move ("changed meanwhile").
+    private void FinishJob(DownloadJob current, string finalState, string message)
+    {
+        lock (sync)
         {
-            InvalidateInventory();
+            cachedInventory = null;
+            inventoryGeneration++;
+            current.Finish(finalState, message);
         }
     }
 
@@ -815,6 +970,125 @@ public sealed class HipsSurveyService
         WriteAtomically(AllskyPath(root), output.ToArray());
     }
 
+    /// <summary>Builds the Allsky unless it exists, one build at a time; true when it was built here.</summary>
+    private async Task<bool> BuildAllskyOnceAsync(string root, CancellationToken token)
+    {
+        await allskyGate.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            // as the scan counts it: an empty file (power lost right after the rename) is built again
+            if (TileExists(AllskyPath(root)))
+            {
+                return false;
+            }
+
+            await BuildAllskyAsync(root, token).ConfigureAwait(false);
+            return true;
+        }
+        finally
+        {
+            allskyGate.Release();
+        }
+    }
+
+    private void StartAllskyBuild(string root)
+    {
+        lock (sync)
+        {
+            if (deleting || !allskyTask.IsCompleted || string.Equals(allskyFailedRoot, root, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            CancellationTokenSource cancellation = new();
+            allskyCancellation = cancellation;
+            allskyTask = Task.Run(async () =>
+            {
+                try
+                {
+                    if (await BuildAllskyOnceAsync(root, cancellation.Token).ConfigureAwait(false))
+                    {
+                        Logger.Info($"{LogPrefix} Built the missing Allsky preview.");
+                    }
+
+                    AllskyBuilt(root);
+                }
+                catch (OperationCanceledException)
+                {
+                    // a delete or the plugin stopping
+                }
+                catch (Exception ex)
+                {
+                    lock (sync)
+                    {
+                        // a build that a delete cancelled may fail on the files going instead of seeing the cancel
+                        if (!cancellation.IsCancellationRequested)
+                        {
+                            allskyFailedRoot = root;
+                        }
+                    }
+
+                    Logger.Warning($"{LogPrefix} Building the missing Allsky preview failed: {ex.Message}");
+                }
+            });
+        }
+    }
+
+    // The cached inventory learns of the new Allsky without another walk of the tiles. A scan that was running
+    // meanwhile may store HasAllsky=false again; the next status then starts a build, which finds the file at once
+    // and lands here again (GetInventory).
+    private void AllskyBuilt(string root)
+    {
+        string path = AllskyPath(root);
+
+        if (!TileExists(path))
+        {
+            return;
+        }
+
+        long bytes = new FileInfo(path).Length;
+
+        lock (sync)
+        {
+            // a new inventory rather than a change of the cached one, which GetStatus reads outside the lock
+            if (cachedInventory is { HasAllsky: false } cached)
+            {
+                cachedInventory = new SurveyInventory
+                {
+                    Orders = cached.Orders,
+                    InstalledOrder = cached.InstalledOrder,
+                    HasAllsky = true,
+                    HasLegacyTiles = cached.HasLegacyTiles,
+                    TotalBytes = cached.TotalBytes + bytes
+                };
+            }
+        }
+    }
+
+    /// <summary>Cancels a background Allsky build and waits for it (a delete, the plugin stopping).</summary>
+    internal void CancelAllskyBuild()
+    {
+        Task running;
+        lock (sync)
+        {
+            allskyCancellation?.Cancel();
+            allskyFailedRoot = null;
+            running = allskyTask;
+        }
+
+        try
+        {
+            if (!running.Wait(TimeSpan.FromSeconds(30)))
+            {
+                Logger.Warning($"{LogPrefix} The Allsky build did not stop within 30 s.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug($"{LogPrefix} Waiting for the Allsky build: {ex.Message}");
+        }
+    }
+
     private string AllskyPath(string root) => AllskyPath(Definition, root);
 
     private static string AllskyPath(SurveyDefinition definition, string root) =>
@@ -897,40 +1171,92 @@ public sealed class HipsSurveyService
 
     // ------------------------------------------------------------------ inventory
 
-    private SurveyInventory GetInventory(string root, bool forceRescan = false)
+    /// <param name="buildAllsky">
+    /// Start the background build of a missing Allsky. Only the status does: a start or delete forces a rescan of
+    /// its own and must not start a build that its download or delete then runs into.
+    /// </param>
+    private SurveyInventory GetInventory(string root, bool forceRescan = false, bool buildAllsky = false)
     {
+        SurveyInventory cached;
         bool jobRunning;
         lock (sync)
         {
-            if (!forceRescan && cachedInventory != null)
+            if (deleting)
             {
-                return cachedInventory;
+                return NothingInstalled();
             }
 
+            cached = forceRescan ? null : cachedInventory;
             jobRunning = job != null && job.IsRunning;
         }
 
-        SurveyInventory inventory = ScanInventory(Definition, root, LoadCoverage(root));
-        // The running job writes properties/Allsky itself; reconciling in parallel would only
-        // duplicate that work on the same files.
-        if (!jobRunning)
+        if (cached != null)
         {
-            ReconcileServedFiles(root, inventory);
+            // A scan that ran while the Allsky was being built may have cached it as missing: the build, or its quick
+            // skip when the file is there, corrects the cache (AllskyBuilt).
+            if (buildAllsky && !jobRunning && !cached.HasAllsky && cached.InstalledOrder != null)
+            {
+                StartAllskyBuild(root);
+            }
+
+            return cached;
         }
 
-        lock (sync)
+        inventoryGate.Wait();
+        try
         {
-            cachedInventory = inventory;
-        }
+            long generation;
+            lock (sync)
+            {
+                // a full delete began while this waited for the gate
+                if (deleting)
+                {
+                    return NothingInstalled();
+                }
 
-        return inventory;
+                // the scan this waited for may have cached what it needs; a job may have started meanwhile
+                if (!forceRescan && cachedInventory != null)
+                {
+                    return cachedInventory;
+                }
+
+                jobRunning = job != null && job.IsRunning;
+                generation = inventoryGeneration;
+            }
+
+            SurveyInventory inventory = ScanInventory(Definition, root, LoadCoverage(root));
+            // The running job writes properties/Allsky itself; reconciling in parallel would only
+            // duplicate that work on the same files.
+            if (!jobRunning)
+            {
+                ReconcileServedFiles(root, inventory, buildAllsky);
+            }
+
+            lock (sync)
+            {
+                if (!deleting && generation == inventoryGeneration)
+                {
+                    cachedInventory = inventory;
+                }
+            }
+
+            return inventory;
+        }
+        finally
+        {
+            inventoryGate.Release();
+        }
     }
+
+    // What a full delete ends in, without reading the half-deleted tree.
+    private SurveyInventory NothingInstalled() => ScanInventory(Definition, root: null);
 
     private void InvalidateInventory()
     {
         lock (sync)
         {
             cachedInventory = null;
+            inventoryGeneration++;
         }
     }
 
@@ -973,10 +1299,13 @@ public sealed class HipsSurveyService
             totalBytes += new FileInfo(AllskyPath(definition, root)).Length;
         }
 
+        // An older plugin's survey starts at the minimum order like every download, and DeleteLegacyTiles removes all of
+        // it, so that order's folder tells; walking the whole tree a second time read up to ~260k entries.
+        string minOrderDir = Path.Combine(root ?? string.Empty, $"Norder{definition.MinOrder}");
         bool hasLegacyTiles = definition.HasLegacyWebp
             && !string.IsNullOrEmpty(root)
-            && Directory.Exists(root)
-            && Directory.EnumerateFiles(root, "*" + LegacyTileExtension, SearchOption.AllDirectories).Any();
+            && Directory.Exists(minOrderDir)
+            && Directory.EnumerateFiles(minOrderDir, "*" + LegacyTileExtension, SearchOption.AllDirectories).Any();
 
         return new SurveyInventory
         {
@@ -994,7 +1323,7 @@ public sealed class HipsSurveyService
     /// cannot serve. With no complete base order the properties file is removed, which is
     /// what tells the app to keep the survey layer off.
     /// </summary>
-    private void ReconcileServedFiles(string root, SurveyInventory inventory)
+    private void ReconcileServedFiles(string root, SurveyInventory inventory, bool buildAllsky)
     {
         if (string.IsNullOrEmpty(root) || !Directory.Exists(root))
         {
@@ -1019,11 +1348,9 @@ public sealed class HipsSurveyService
                 WriteProperties(root, inventory.InstalledOrder.Value, sourceUrls[0]);
             }
 
-            if (!inventory.HasAllsky)
+            if (!inventory.HasAllsky && buildAllsky)
             {
-                BuildAllskyAsync(root, CancellationToken.None).GetAwaiter().GetResult();
-                inventory.HasAllsky = true;
-                inventory.TotalBytes += new FileInfo(AllskyPath(root)).Length;
+                StartAllskyBuild(root);
             }
         }
         catch (Exception ex)

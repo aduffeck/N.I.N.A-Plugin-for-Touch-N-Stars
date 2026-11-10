@@ -262,6 +262,8 @@ public class HipsSurveyServiceTests
         Assert.True(Directory.Exists(Path.Combine(survey.Root, "Norder4")));
         Assert.False(Directory.Exists(Path.Combine(survey.Root, "Norder5")));
         Assert.Equal(4, service.GetStatus().InstalledOrder);
+        // the status started the background build of the missing Allsky: not into the folder the test removes
+        service.CancelAllskyBuild();
     }
 
     [Fact]
