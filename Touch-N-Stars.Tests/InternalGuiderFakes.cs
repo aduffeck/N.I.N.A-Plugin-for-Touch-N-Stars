@@ -45,8 +45,8 @@ public class InterfaceFake : DispatchProxy
     }
 }
 
-/// <summary>The internal guider with the optional Guiding Coach and flight recorder, as one interface for the fake.</summary>
-public interface IFullInternalGuider : IGuidingCoach, IGuideIncidentRecorder
+/// <summary>The internal guider with the optional Guiding Coach, flight recorder and guide log archive, as one interface for the fake.</summary>
+public interface IFullInternalGuider : IGuidingCoach, IGuideIncidentRecorder, IGuideLogArchive
 {
 }
 
@@ -89,6 +89,9 @@ public sealed class FakeInternalGuider
 
     /// <summary>Files of the zip that WriteIncidentArchive writes for a known incident.</summary>
     public Dictionary<string, byte[]> ArchiveFiles { get; } = new() { ["README.txt"] = Encoding.UTF8.GetBytes("PINS incident") };
+
+    /// <summary>Guide logs by name (text); the list hands them out newest first by name.</summary>
+    public Dictionary<string, string> GuideLogs { get; } = new();
 
     /// <summary>Optional per-call behaviour (method name, args); a non-null result replaces the default.</summary>
     public Func<string, object?[]?, object?>? OnCall { get; set; }
@@ -189,6 +192,12 @@ public sealed class FakeInternalGuider
                 }
                 return Task.FromResult(true);
             }
+            case "GetGuideLogs":
+                return GuideLogs.OrderByDescending(l => l.Key, StringComparer.Ordinal)
+                    .Select(l => new AdvancedGuideLogFile { Name = l.Key, SizeBytes = Encoding.UTF8.GetByteCount(l.Value), TimeZone = "Europe/Berlin", UtcOffsetMinutes = 60 })
+                    .ToList();
+            case "OpenGuideLog":
+                return GuideLogs.TryGetValue((string)args![0]!, out string? log) ? new MemoryStream(Encoding.UTF8.GetBytes(log)) : null;
             case "add_AdvancedGuiderEvent":
                 lock (handlers) handlers.Add((EventHandler<AdvancedGuiderEventArgs>)args![0]!);
                 return null;
