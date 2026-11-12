@@ -84,7 +84,9 @@ public static class CalibrationSlew
     }
 
     /// <summary>Slews to the calibration position on <paramref name="side"/>; throws when the mount cannot or did not get there.</summary>
-    public static async Task SlewAsync(ITelescopeMediator telescope, CalibrationSlewSide side, CancellationToken ct)
+    /// <param name="notStarted">What did not start because of a failed slew, for the error message.</param>
+    public static async Task SlewAsync(ITelescopeMediator telescope, CalibrationSlewSide side, CancellationToken ct,
+        string notStarted = "no calibration was started")
     {
         TelescopeInfo info = telescope?.GetInfo();
         string blocker = Blocker(info);
@@ -101,7 +103,7 @@ public static class CalibrationSlew
             {
                 if (!await telescope.SlewToCoordinatesAsync(coordinates, ct).ConfigureAwait(false))
                 {
-                    throw new InvalidOperationException("The mount did not reach the calibration position, so no calibration was started. See the N.I.N.A. log for the reason.");
+                    throw new InvalidOperationException($"The mount did not reach the calibration position, so {notStarted}. See the N.I.N.A. log for the reason.");
                 }
             }
         }

@@ -124,7 +124,7 @@ public class InternalGuiderCoachApiTests
 
         (int status, JObject json) = await host.Post("coach/start",
             "{\"steps\":[\"trials\",\"CameraCheck\",\"Drift\"],\"exposureSeconds\":[2,1,2],\"gains\":[300,100],\"framesPerCombination\":4," +
-            "\"driftSeconds\":240,\"trialSeconds\":60,\"repeatBaseline\":false,\"allowCalibration\":false}");
+            "\"driftSeconds\":240,\"trialSeconds\":60,\"repeatBaseline\":false,\"exposureTrial\":false,\"allowCalibration\":false}");
 
         Assert.Equal(200, status);
         Assert.Equal("coach-start", (string?)json["response"]!["action"]);
@@ -139,6 +139,7 @@ public class InternalGuiderCoachApiTests
         Assert.Equal(240, options.DriftSeconds);
         Assert.Equal(60, options.TrialSeconds);
         Assert.False(options.RepeatBaseline);
+        Assert.False(options.ExposureTrial);
         Assert.False(options.AllowCalibration);
     }
 
@@ -159,6 +160,7 @@ public class InternalGuiderCoachApiTests
         Assert.Equal(180, options.DriftSeconds);
         Assert.Equal(120, options.TrialSeconds);
         Assert.True(options.RepeatBaseline);
+        Assert.True(options.ExposureTrial);
         Assert.True(options.AllowCalibration);
     }
 
