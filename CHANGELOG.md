@@ -1,6 +1,7 @@
 # Touch 'N' Stars
 
 ## Unreleased
+- Internal guider API: `GET /api/internal-guider/logs` lists the guide logs of the internal guider (one per night, newest first, with size, last write, whether it is being written and the host's time zone) and `GET /api/internal-guider/logs/{name}` sends one as text, gzip-compressed when the client accepts it; both also while the guider is not connected; see `INTERNAL_GUIDER_API.md`
 - Internal guider API: `POST /api/internal-guider/coach/start?slew=stay|east|west` slews to a calibration position before the Guiding Coach starts, as before a calibration; Stop or `coach/cancel` cancel the slew; a running session, calibration or dark library build is refused before the mount moves; see `INTERNAL_GUIDER_API.md`
 - Internal guider API: `POST /api/internal-guider/coach/start` takes `exposureTrial` (default true) to switch the coach's shorter-exposure trials (E, E2) on or off; dismissing the one-time `hint.longExposure` hides it for good; see `INTERNAL_GUIDER_API.md`
 - Atlas: new survey `nsns-cont` (NSNS DR0.2 RGB continuum, rgb8), orders 3–5

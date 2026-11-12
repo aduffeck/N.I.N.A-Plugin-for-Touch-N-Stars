@@ -487,7 +487,7 @@ public partial class InternalGuiderController : WebApiController
 
     /// <summary>501 for an optional part of the contract (<see cref="IGuidingCoach"/>, <see cref="IGuideIncidentRecorder"/>) the guider lacks.</summary>
     private Task SendNotSupported(string function)
-        => SendError(501, "NotSupported", $"The connected guider does not support {function}.");
+        => SendError(501, "NotSupported", $"The guider does not support {function}.");
 
     private Task SendError(int status, string code, string error)
         => SendJson(status, new { success = false, error, code });

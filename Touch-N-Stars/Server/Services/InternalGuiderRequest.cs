@@ -255,6 +255,19 @@ internal static class InternalGuiderRequest
         return true;
     }
 
+    public const int MaxGuideLogNameLength = 200;
+
+    /// <summary>Guide log names (InternalGuider_GuideLog_yyyy-MM-dd.txt) consist of ASCII letters, digits, '_', '-' and '.', and never start with '.'.</summary>
+    public static bool IsValidGuideLogName(string name)
+    {
+        if (string.IsNullOrEmpty(name) || name.Length > MaxGuideLogNameLength || name[0] == '.') return false;
+        foreach (char c in name)
+        {
+            if (!char.IsAsciiLetterOrDigit(c) && c != '-' && c != '_' && c != '.') return false;
+        }
+        return name.EndsWith(".txt", StringComparison.OrdinalIgnoreCase);
+    }
+
     /// <summary>Parses { kept: true|false }.</summary>
     public static bool TryParseKeepBody(string body, out bool kept, out string error)
     {

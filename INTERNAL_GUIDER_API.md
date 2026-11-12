@@ -5,8 +5,8 @@ REST and WebSocket API for the pins internal guider: the guider that implements 
 the internal guider's live data (frames, stars, guide steps, statistics), its settings and controls, the Guiding
 Coach and the flight recorder.
 
-The Guiding Coach and the flight recorder are optional parts of the contract (`IGuidingCoach`,
-`IGuideIncidentRecorder`); their routes answer 501 for a guider without them. The DTOs named below are the
+The Guiding Coach, the flight recorder and the guide logs are optional parts of the contract (`IGuidingCoach`,
+`IGuideIncidentRecorder`, `IGuideLogArchive`); their routes answer 501 for a guider without them. The DTOs named below are the
 contract's classes in `NINA.Equipment.Equipment.MyGuider.Advanced`, serialized as they are. The contract has
 no version: pins, this plugin and the guider are built together.
 
@@ -117,6 +117,18 @@ only `mark` needs the internal guider connected. Incident ids (`yyyyMMdd-HHmmss-
 | DELETE | `/incidents` | | `{ deleted: n }`: deletes all incidents that are not kept. |
 | POST | `/incidents/mark` | `{ note }` (optional, one line, at most 500 characters) | `{ id }`. Records the last 2 minutes and the next 30 seconds as a manual incident; the guider must guide or calibrate (409 `Rejected` with its reason otherwise). |
 | GET | `/incidents/{id}/download` | | `application/zip`, `Content-Disposition: attachment; filename="pins-incident-<id>.zip"`: frames as FITS, telemetry, diagnosis, settings, and guide-log and PINS-log excerpts. It is streamed while the guider writes it; an error after the first 64 KB can only be logged, and the client then has a truncated zip. |
+
+## Guide logs
+
+The PHD2-format guide logs the guider wrote, one per night (noon to noon, local time), for the log viewer. Like the
+incidents they can be read while the internal guider is not connected or another guider is. Optional part of the
+contract (`IGuideLogArchive`, 501 without it). Names consist of ASCII letters, digits, `_`, `-` and `.`, end in
+`.txt` and do not start with `.`; any other name is answered with 400 before it reaches the guider.
+
+| Method | Route | Parameters | Response |
+|---|---|---|---|
+| GET | `/logs` | | `AdvancedGuideLogFile[]`, newest night first: `{ name, night, sizeBytes, modifiedUtc, active, timeZone, utcOffsetMinutes }`. `active` marks the log being written; `timeZone` (host zone id, IANA on Linux) and `utcOffsetMinutes` (its current offset) say how to read the log's wall-clock times. |
+| GET | `/logs/{name}` | | The log as `text/plain; charset=utf-8`, gzip-compressed when the client accepts it; 404 `NotFound` for an unknown name. The active log is sent up to what it holds. |
 
 ## WebSocket `/ws/internal-guider`
 
