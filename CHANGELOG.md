@@ -1,7 +1,7 @@
 # Touch 'N' Stars
 
 ## Unreleased
-- Internal guider API: `POST /api/internal-guider/coach/start?slew=stay|east|west` slews to a calibration position before the Guiding Coach starts, as before a calibration; Stop or `coach/cancel` cancel the slew; see `INTERNAL_GUIDER_API.md`
+- Internal guider API: `POST /api/internal-guider/coach/start?slew=stay|east|west` slews to a calibration position before the Guiding Coach starts, as before a calibration; Stop or `coach/cancel` cancel the slew; a running session, calibration or dark library build is refused before the mount moves; see `INTERNAL_GUIDER_API.md`
 - Internal guider API: `POST /api/internal-guider/coach/start` takes `exposureTrial` (default true) to switch the coach's shorter-exposure trials (E, E2) on or off; dismissing the one-time `hint.longExposure` hides it for good; see `INTERNAL_GUIDER_API.md`
 - Atlas: new survey `nsns-cont` (NSNS DR0.2 RGB continuum, rgb8), orders 3–5
 - Raw image data: `GET /api/raw-image/prepared`, `/api/raw-image/history` and `/api/raw-image/livestack` serve 16-bit preview planes plus an exact full-resolution histogram (65536 bins per channel) and statistics for the app's histogram and client-side stretch; OSC frames are superpixel-debayered, responses are gzip-compressed

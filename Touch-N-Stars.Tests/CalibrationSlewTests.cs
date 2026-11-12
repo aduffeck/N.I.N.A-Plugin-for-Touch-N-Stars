@@ -319,11 +319,10 @@ public class CalibrationSlewApiTests
 
         (int status, JObject json) = await host.Post("coach/start?slew=east", "{}");
 
-        // Fast enough to answer within the call timeout, or late as an action event.
-        string? error = status == 202
-            ? (string?)EventWaiter.PayloadJson(await waitFor(e => e.Type == "action"))["error"]
-            : (string?)json["error"];
-        Assert.Contains("the Guiding Coach did not start", error);
+        // A mount that does not get there is a refusal, not a server error.
+        Assert.Equal(409, status);
+        Assert.Equal("Rejected", (string?)json["code"]);
+        Assert.Contains("the Guiding Coach did not start", (string?)json["error"]);
         Assert.Empty(fake.CallsOf(nameof(IGuidingCoach.StartCoach)));
         Assert.False(host.Service.CalibrationSlewInProgress);
     }
@@ -352,8 +351,57 @@ public class CalibrationSlewApiTests
 
         JObject payload = EventWaiter.PayloadJson(await waitFor(e => e.Type == "action" && (string?)EventWaiter.PayloadJson(e)["action"] == "coach-start"));
         Assert.False((bool)payload["success"]!);
+        Assert.Equal("The slew to the calibration position was cancelled.", (string?)payload["error"]);
         Assert.Contains("StopSlew", rig.Calls);
         Assert.Empty(fake.CallsOf(nameof(IGuidingCoach.StartCoach)));
+        Assert.False(host.Service.CalibrationSlewInProgress);
+    }
+
+    [Theory]
+    [InlineData("Running", "Stopped", "already running")]
+    [InlineData("Idle", "Calibrating", "calibrating")]
+    public async Task CoachStart_WithSlew_WhileBusy_IsRefusedBeforeAnythingMoves(string phase, string state, string message)
+    {
+        var fake = new FakeInternalGuider { State = state, CoachStatus = new AdvancedCoachStatus { Phase = phase } };
+        var rig = new Rig(fake, Mount());
+        using var host = new InternalGuiderApiHost(rig.Mediator, telescope: rig.Telescope);
+
+        (int status, JObject json) = await host.Post("coach/start?slew=stay", "{}");
+
+        Assert.Equal(409, status);
+        Assert.Equal("coach.busy", (string?)json["messageCode"]);
+        Assert.Contains(message, (string?)json["error"]);
+        Assert.Empty(rig.Calls);
+        Assert.Empty(fake.CallsOf(nameof(IGuidingCoach.StartCoach)));
+        Assert.False(host.Service.CalibrationSlewInProgress);
+    }
+
+    [Fact]
+    public async Task CoachStart_RefusedAfterALongSlew_ActionCarriesTheMessageCode()
+    {
+        var fake = new FakeInternalGuider { State = "Stopped" };
+        fake.OnCall = (name, _) => name == nameof(IGuidingCoach.StartCoach)
+            ? Task.FromResult(new AdvancedCoachStartResult
+            {
+                Accepted = false,
+                Message = "The guide camera is not connected.",
+                MessageCode = "coach.notConnected",
+            })
+            : null;
+        var rig = new Rig(fake, Mount());
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Slew = _ => release.Task;
+        using var host = new InternalGuiderApiHost(rig.Mediator, telescope: rig.Telescope);
+        var waitFor = EventWaiter.Collect(host.Service);
+
+        Assert.Equal(202, (await host.Post("coach/start?slew=stay", "{}")).Status);
+        release.SetResult(true);
+
+        JObject payload = EventWaiter.PayloadJson(await waitFor(e => e.Type == "action"));
+        Assert.Equal("coach-start", (string?)payload["action"]);
+        Assert.False((bool)payload["success"]!);
+        Assert.Equal("coach.notConnected", (string?)payload["messageCode"]);
+        Assert.Equal("The guide camera is not connected.", (string?)payload["error"]);
         Assert.False(host.Service.CalibrationSlewInProgress);
     }
 
