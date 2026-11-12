@@ -50,13 +50,16 @@ internal sealed class InternalGuiderApiHost : IDisposable
     public Task<(int Status, JObject Json)> Delete(string path) => Send(HttpMethod.Delete, path, null);
 
     /// <summary>A GET whose body is not JSON (images, downloads): the status, the response (headers) and the body.</summary>
-    public async Task<(int Status, HttpResponseMessage Response, byte[] Body)> GetRaw(string path)
+    /// <param name="acceptEncoding">Sent as Accept-Encoding (e.g. "gzip"); the body is returned as it came, not decoded.</param>
+    public async Task<(int Status, HttpResponseMessage Response, byte[] Body)> GetRaw(string path, string? acceptEncoding = null)
     {
         for (int attempt = 0; ; attempt++)
         {
+            using var request = new HttpRequestMessage(HttpMethod.Get, path);
+            if (acceptEncoding != null) request.Headers.TryAddWithoutValidation("Accept-Encoding", acceptEncoding);
             try
             {
-                HttpResponseMessage response = await client.GetAsync(path);
+                HttpResponseMessage response = await client.SendAsync(request);
                 byte[] body = await response.Content.ReadAsByteArrayAsync();
                 return ((int)response.StatusCode, response, body);
             }

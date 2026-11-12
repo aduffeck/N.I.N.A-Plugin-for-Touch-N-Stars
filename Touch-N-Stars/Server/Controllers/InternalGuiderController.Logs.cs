@@ -3,6 +3,7 @@ using System.IO;
 using System.Threading.Tasks;
 using EmbedIO;
 using EmbedIO.Routing;
+using NINA.Core.Utility;
 using NINA.Equipment.Equipment.MyGuider.Advanced;
 using NINA.Equipment.Interfaces;
 using TouchNStars.Server.Services;
@@ -42,8 +43,20 @@ public partial class InternalGuiderController
             HttpContext.Response.StatusCode = 200;
             HttpContext.Response.ContentType = "text/plain; charset=utf-8";
             HttpContext.Response.Headers.Add("Cache-Control", "no-cache, no-store, must-revalidate");
-            using Stream output = HttpContext.OpenResponseStream(buffered: false, preferCompression: true);
-            await log.CopyToAsync(output, GuideLogBufferSize, HttpContext.CancellationToken);
+
+            // Once the headers are out, a failure (the phone left the WLAN, the app was closed, a read error on the card)
+            // can no longer become an error response: log it and end the request.
+            bool started = false;
+            try
+            {
+                await using Stream output = HttpContext.OpenResponseStream(buffered: false, preferCompression: true);
+                started = true;
+                await log.CopyToAsync(output, GuideLogBufferSize, HttpContext.CancellationToken);
+            }
+            catch (Exception ex) when (started)
+            {
+                Logger.Warning($"InternalGuider: download of guide log {name} broke off: {ex.GetType().Name}: {ex.Message}");
+            }
         });
     }
 

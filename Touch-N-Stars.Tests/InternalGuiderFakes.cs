@@ -55,7 +55,7 @@ public sealed class FakeInternalGuider
 {
     private readonly List<EventHandler<AdvancedGuiderEventArgs>> handlers = new();
 
-    /// <param name="optionalParts">Whether the guider also implements <see cref="IGuidingCoach"/> and <see cref="IGuideIncidentRecorder"/>.</param>
+    /// <param name="optionalParts">Whether the guider also implements <see cref="IGuidingCoach"/>, <see cref="IGuideIncidentRecorder"/> and <see cref="IGuideLogArchive"/>.</param>
     public FakeInternalGuider(bool optionalParts = true)
     {
         Guider = optionalParts ? InterfaceFake.Create<IFullInternalGuider>(Handle) : InterfaceFake.Create<IAdvancedGuider>(Handle);

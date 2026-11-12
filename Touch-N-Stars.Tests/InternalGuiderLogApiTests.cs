@@ -54,6 +54,35 @@ public class InternalGuiderLogApiTests
     }
 
     [Fact]
+    public async Task Get_SendsTheLogGzipped_WhenTheClientAcceptsIt_AlsoWhileNotConnected()
+    {
+        FakeInternalGuider fake = WithLogs();
+        fake.Connected = false;
+        using var host = new InternalGuiderApiHost(fake.Mediator, fake.Guider);
+
+        (int status, HttpResponseMessage response, byte[] body) = await host.GetRaw($"logs/{Night}", acceptEncoding: "gzip");
+
+        Assert.Equal(200, status);
+        Assert.Contains("gzip", response.Content.Headers.ContentEncoding);
+        Assert.Equal(Text, Encoding.UTF8.GetString(Gunzip(body)));
+    }
+
+    [Fact]
+    public async Task Get_ReadErrorAfterTheStart_KeepsWhatWasSent_AndTheServerUp()
+    {
+        FakeInternalGuider fake = WithLogs();
+        fake.OnCall = (method, _) => method == "OpenGuideLog" ? new FailingStream(Encoding.UTF8.GetBytes(Text)) : null;
+        using var host = new InternalGuiderApiHost(fake.Mediator);
+
+        (int status, HttpResponseMessage response, byte[] body) = await host.GetRaw($"logs/{Night}");
+
+        Assert.Equal(200, status);
+        Assert.Equal(Text, Encoding.UTF8.GetString(body));
+        // The server is still fine afterwards.
+        Assert.Equal(200, (await host.Get("logs")).Status);
+    }
+
+    [Fact]
     public async Task Get_UnknownLog_Is404()
     {
         using var host = new InternalGuiderApiHost(WithLogs().Mediator);
@@ -91,6 +120,19 @@ public class InternalGuiderLogApiTests
 
         Assert.Equal(501, status);
         Assert.Equal("NotSupported", (string?)json["code"]);
+    }
+
+    /// <summary>Hands out <c>data</c> on the first read and fails on the next, like a card read error mid-file.</summary>
+    private sealed class FailingStream(byte[] data) : MemoryStream(data)
+    {
+        public override int Read(byte[] buffer, int offset, int count)
+            => Position < Length ? base.Read(buffer, offset, count) : throw new IOException("read error");
+
+        public override System.Threading.Tasks.ValueTask<int> ReadAsync(System.Memory<byte> buffer, System.Threading.CancellationToken cancellationToken = default)
+            => Position < Length ? base.ReadAsync(buffer, cancellationToken) : throw new IOException("read error");
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, System.Threading.CancellationToken cancellationToken)
+            => Position < Length ? base.ReadAsync(buffer, offset, count, cancellationToken) : throw new IOException("read error");
     }
 
     private static byte[] Gunzip(byte[] data)
