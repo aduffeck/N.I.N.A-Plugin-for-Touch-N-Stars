@@ -66,6 +66,8 @@ public sealed class InternalGuiderService
     private CancellationTokenSource darksCts;
     private int ditherRunning;
     private int calibrationSlewRunning;
+    // 1 while a Guiding Coach start slews to the calibration position (Stop cancels it).
+    private int coachSlewRunning;
 
     /// <param name="internalGuiderProvider">The internal guider, also while it is not connected (pins exports it to plugins).</param>
     /// <param name="telescopeProvider">The mount, for the slew to the calibration position.</param>
@@ -89,6 +91,9 @@ public sealed class InternalGuiderService
 
     /// <summary>True while a start-guiding call slews to the calibration position (before its calibration).</summary>
     public bool CalibrationSlewInProgress => Volatile.Read(ref calibrationSlewRunning) != 0;
+
+    /// <summary>True while a dark library build started through this API runs.</summary>
+    public bool DarksInProgress => Volatile.Read(ref darksCts) != null;
 
     #region Guider resolution
 
@@ -518,11 +523,15 @@ public sealed class InternalGuiderService
         return true;
     }
 
-    /// <summary>Cancels a pending start (calibration/settling) issued through this API.</summary>
+    /// <summary>
+    /// Cancels a pending start (calibration/settling) issued through this API, and a Guiding Coach start while it slews
+    /// to the calibration position (Stop cancels that slew like the one before a calibration).
+    /// </summary>
     public void CancelGuidingStart()
     {
         CancellationTokenSource cts = Interlocked.Exchange(ref guidingStartCts, null);
         try { cts?.Cancel(); } catch (ObjectDisposedException) { }
+        if (Volatile.Read(ref coachSlewRunning) != 0) CancelSlot(coachStartSlot);
     }
 
     /// <summary>
@@ -614,9 +623,12 @@ public sealed class InternalGuiderService
         return true;
     }
 
-    private void PublishAction(string action, bool success, string error)
+    private void PublishAction(string action, bool success, string error, string messageCode = null, Dictionary<string, object> messageParameters = null)
     {
-        Publish(new InternalGuiderEvent("action", DateTime.UtcNow, new { action, success, error }));
+        object payload = messageCode == null
+            ? new { action, success, error }
+            : new { action, success, error, messageCode, messageParameters = messageParameters ?? new Dictionary<string, object>() };
+        Publish(new InternalGuiderEvent("action", DateTime.UtcNow, payload));
     }
 
     #endregion
@@ -635,15 +647,78 @@ public sealed class InternalGuiderService
     /// Starts a session. The outcome is Completed with Success = accepted; the guider's result (rejection
     /// reason, message code and parameters, status) comes along when the call returned in time.
     /// </summary>
-    public async Task<(GuiderCallOutcome Outcome, AdvancedCoachStartResult Result)> StartCoachAsync(IGuidingCoach coach, AdvancedCoachOptions options)
+    /// <param name="slew">
+    /// Slew to the calibration position on this side first: the guider stops for the slew, a slew that fails or is
+    /// cancelled (coach/cancel or Stop) starts no session. The call then mostly outlasts <see cref="CallTimeout"/> and
+    /// ends as an 'action' event. Refused (Busy) while another calibration slew runs.
+    /// </param>
+    public async Task<(GuiderCallOutcome Outcome, AdvancedCoachStartResult Result)> StartCoachAsync(IGuidingCoach coach, AdvancedCoachOptions options,
+        CalibrationSlewSide? slew = null)
     {
+        if (slew.HasValue)
+        {
+            if (Interlocked.CompareExchange(ref calibrationSlewRunning, 1, 0) != 0) return (GuiderCallOutcome.Busy(), null);
+            // Set before the call is queued, so a Stop right after the request already cancels the slew.
+            Interlocked.Exchange(ref coachSlewRunning, 1);
+        }
+
         AdvancedCoachStartResult result = null;
         GuiderCallOutcome outcome = await RunGuiderCallAsync("coach-start", async ct =>
         {
+            if (slew.HasValue)
+            {
+                string slewError = null;
+                try
+                {
+                    // Stops guiding and its exposures; the coach picks a new star where the mount stops.
+                    IGuiderMediator mediator = Mediator;
+                    if (mediator != null && !await mediator.StopGuiding(ct).ConfigureAwait(false))
+                    {
+                        Logger.Warning("InternalGuider: guiding did not report stopped before the coach's calibration slew.");
+                    }
+                    await CalibrationSlew.SlewAsync(Telescope, slew.Value, ct, "the Guiding Coach did not start").ConfigureAwait(false);
+                }
+                // Same words as the slew before a calibration (start-guiding).
+                catch (OperationCanceledException)
+                {
+                    slewError = "The slew to the calibration position was cancelled.";
+                }
+                catch (InvalidOperationException ex)
+                {
+                    // CalibrationSlew's own failures already say what happened.
+                    Logger.Warning($"InternalGuider: coach calibration slew: {ex.Message}");
+                    slewError = ex.Message;
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"InternalGuider: coach calibration slew failed: {ex}");
+                    slewError = $"The slew to the calibration position failed: {ex.Message}";
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref coachSlewRunning, 0);
+                    Interlocked.Exchange(ref calibrationSlewRunning, 0);
+                }
+
+                if (slewError != null)
+                {
+                    Volatile.Write(ref result, new AdvancedCoachStartResult { Accepted = false, Message = slewError });
+                    return false;
+                }
+            }
+
             AdvancedCoachStartResult r = await coach.StartCoach(options, ct).ConfigureAwait(false);
             Volatile.Write(ref result, r);
             return r?.Accepted == true;
-        }, () => Volatile.Read(ref result)?.Message ?? "The Guiding Coach did not start.", coachStartSlot).ConfigureAwait(false);
+        }, () => Volatile.Read(ref result)?.Message ?? "The Guiding Coach did not start.", coachStartSlot,
+            () => Volatile.Read(ref result) is { MessageCode: not null } r ? (r.MessageCode, r.MessageParameters) : (null, null)).ConfigureAwait(false);
+
+        // A start already in flight (Busy) never ran the call, so the slew flags are still ours to clear.
+        if (slew.HasValue && outcome.State == GuiderCallState.Busy)
+        {
+            Interlocked.Exchange(ref coachSlewRunning, 0);
+            Interlocked.Exchange(ref calibrationSlewRunning, 0);
+        }
         return (outcome, Volatile.Read(ref result));
     }
 
@@ -701,10 +776,11 @@ public sealed class InternalGuiderService
     /// yields its result; one still running continues in the background and publishes its outcome as an
     /// 'action' event (no error text when it was cancelled on purpose). With a <paramref name="slot"/>
     /// only one such call runs at a time (Busy otherwise) and the slot's token can be cancelled.
-    /// <paramref name="describeFailure"/> words a late 'false' result for the 'action' event.
+    /// <paramref name="describeFailure"/> words a late 'false' result for the 'action' event, <paramref name="describeCode"/>
+    /// adds its message code and parameters (code null: none).
     /// </summary>
     internal async Task<GuiderCallOutcome> RunGuiderCallAsync(string action, Func<CancellationToken, Task<bool>> call, Func<string> describeFailure,
-        OperationSlot slot = null)
+        OperationSlot slot = null, Func<(string Code, Dictionary<string, object> Parameters)> describeCode = null)
     {
         var cts = new CancellationTokenSource();
         if (slot != null && Interlocked.CompareExchange(ref slot.Cts, cts, null) != null)
@@ -724,11 +800,14 @@ public sealed class InternalGuiderService
         {
             GuiderCallOutcome outcome = t.Result;
             string error = null;
+            string messageCode = null;
+            Dictionary<string, object> messageParameters = null;
             if (!outcome.Success && !outcome.Cancelled)
             {
                 try
                 {
                     error = outcome.Error ?? describeFailure?.Invoke();
+                    if (!outcome.Faulted && describeCode != null) (messageCode, messageParameters) = describeCode();
                 }
                 catch (Exception ex)
                 {
@@ -736,7 +815,7 @@ public sealed class InternalGuiderService
                 }
                 error ??= $"'{action}' failed.";
             }
-            PublishAction(action, outcome.Success, error);
+            PublishAction(action, outcome.Success, error, messageCode, messageParameters);
         }, TaskScheduler.Default);
         return GuiderCallOutcome.Pending();
     }

@@ -168,11 +168,13 @@ internal static class InternalGuiderRequest
         if (!TryReadNumber(json, "driftSeconds", options.DriftSeconds, out double drift, out error)) return false;
         if (!TryReadNumber(json, "trialSeconds", options.TrialSeconds, out double trial, out error)) return false;
         if (!TryReadBool(json, "repeatBaseline", options.RepeatBaseline, out bool repeatBaseline, out error)) return false;
+        if (!TryReadBool(json, "exposureTrial", options.ExposureTrial, out bool exposureTrial, out error)) return false;
         if (!TryReadBool(json, "allowCalibration", options.AllowCalibration, out bool allowCalibration, out error)) return false;
         options.FramesPerCombination = frames;
         options.DriftSeconds = drift;
         options.TrialSeconds = trial;
         options.RepeatBaseline = repeatBaseline;
+        options.ExposureTrial = exposureTrial;
         options.AllowCalibration = allowCalibration;
         error = null;
         return true;

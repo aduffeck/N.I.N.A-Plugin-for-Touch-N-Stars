@@ -22,7 +22,11 @@ public partial class InternalGuiderController
         return WithCoachAsync("coach", coach => SendOk(InternalGuiderService.GetCoachStatus(coach)));
     }
 
-    /// <summary>POST /api/internal-guider/coach/start - body AdvancedCoachOptions: start a Guiding Coach session.</summary>
+    /// <summary>
+    /// POST /api/internal-guider/coach/start?slew=stay|east|west - body AdvancedCoachOptions: start a Guiding Coach session.
+    /// With slew the mount first slews to the calibration position on that side of the meridian (as before a calibration);
+    /// the answer is then mostly 202 and the outcome follows as a 'coach-start' action event.
+    /// </summary>
     [Route(HttpVerbs.Post, "/internal-guider/coach/start")]
     public Task StartCoach()
     {
@@ -35,7 +39,38 @@ public partial class InternalGuiderController
                 return;
             }
 
-            (GuiderCallOutcome outcome, AdvancedCoachStartResult result) = await Service.StartCoachAsync(coach, options);
+            CalibrationSlewSide? slew = null;
+            string slewValue = Query("slew");
+            if (!string.IsNullOrWhiteSpace(slewValue))
+            {
+                if (!CalibrationSlew.TryParseSide(slewValue, out CalibrationSlewSide side))
+                {
+                    await SendError(400, "InvalidRequest", "'slew' must be stay, east or west.");
+                    return;
+                }
+                string blocker = CalibrationSlew.Blocker(Service.Telescope?.GetInfo());
+                if (blocker != null)
+                {
+                    await SendError(409, "Rejected", blocker);
+                    return;
+                }
+                if (Service.CalibrationSlewInProgress)
+                {
+                    await SendError(409, "Rejected", "The mount is slewing to the calibration position.");
+                    return;
+                }
+                // The slew stops guiding (and with it a running session or calibration) and moves the mount, so the
+                // guider's own reasons to refuse are checked first. Near the pole is left to the guider: the slew fixes that.
+                string busy = CoachSlewBusyReason(coach);
+                if (busy != null)
+                {
+                    await SendError(409, "Rejected", busy, "coach.busy", new Dictionary<string, object>());
+                    return;
+                }
+                slew = side;
+            }
+
+            (GuiderCallOutcome outcome, AdvancedCoachStartResult result) = await Service.StartCoachAsync(coach, options, slew);
             if (outcome.State == GuiderCallState.Completed && !outcome.Success && !outcome.Cancelled && !outcome.Faulted)
             {
                 // Rejected: the reason comes with the start result (the session status is left alone).
@@ -48,9 +83,20 @@ public partial class InternalGuiderController
 
             await SendCallOutcome("coach-start", outcome,
                 () => result?.Status ?? InternalGuiderService.GetCoachStatus(coach),
-                "A Guiding Coach session is already starting.",
+                slew.HasValue && Service.CalibrationSlewInProgress
+                    ? "The mount is slewing to the calibration position."
+                    : "A Guiding Coach session is already starting.",
                 () => "The guider did not start the Guiding Coach.");
         });
+    }
+
+    /// <summary>Why a coach start with a slew is refused before anything moves, or null.</summary>
+    private string CoachSlewBusyReason(IGuidingCoach coach)
+    {
+        if (InternalGuiderStates.IsCoachRunning(InternalGuiderService.GetCoachStatus(coach))) return "A Guiding Coach session is already running.";
+        if (string.Equals(coach.GetStatus()?.State, AdvancedGuiderStates.Calibrating, StringComparison.OrdinalIgnoreCase)) return "The guider is calibrating.";
+        if (Service.DarksInProgress) return "The guider is building its dark library.";
+        return null;
     }
 
     /// <summary>POST /api/internal-guider/coach/skip - skip the running step (its usable partial results are kept).</summary>
@@ -173,7 +219,7 @@ public partial class InternalGuiderController
         }, requireConnected: false);
     }
 
-    /// <summary>POST /api/internal-guider/hints/dismiss - body { id }: hide a live hint for the rest of the guiding session.</summary>
+    /// <summary>POST /api/internal-guider/hints/dismiss - body { id }: hide a live hint for the rest of the guiding session, a one-time hint for good.</summary>
     [Route(HttpVerbs.Post, "/internal-guider/hints/dismiss")]
     public Task DismissHint()
     {
