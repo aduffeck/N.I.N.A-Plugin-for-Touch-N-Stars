@@ -59,7 +59,11 @@ namespace TouchNStars {
         IDomeMediator dome = null,
         ISwitchMediator switchMediator = null,
         IWeatherDataMediator weatherData = null,
-        IPlateSolverFactory plateSolverFactory = null) {
+        IPlateSolverFactory plateSolverFactory = null
+#if PINS
+        , IGuideCameraMediator guideCamera = null
+#endif
+        ) {
 
         public readonly IDeepSkyObjectSearchVM DeepSkyObjectSearchVM = DeepSkyObjectSearchVM;
         public readonly IImageDataFactory ImageDataFactory = ImageDataFactory;
@@ -91,6 +95,10 @@ namespace TouchNStars {
         public readonly IDomeMediator Dome = dome;
         public readonly ISwitchMediator Switch = switchMediator;
         public readonly IWeatherDataMediator WeatherData = weatherData;
+#if PINS
+        // pins: the guide camera slot next to the imaging camera; disconnecting the guider leaves it connected.
+        public readonly IGuideCameraMediator GuideCamera = guideCamera;
+#endif
     }
 
     [Export(typeof(IPluginManifest))]
@@ -139,7 +147,11 @@ namespace TouchNStars {
                     IRotatorMediator rotatorMediator,
                     IDomeMediator domeMediator,
                     ISwitchMediator switchMediator,
-                    IWeatherDataMediator weatherDataMediator) {
+                    IWeatherDataMediator weatherDataMediator
+#if PINS
+                    , IGuideCameraMediator guideCameraMediator
+#endif
+                    ) {
             if (Settings.Default.UpdateSettings) {
                 Settings.Default.Upgrade();
                 Settings.Default.UpdateSettings = false;
@@ -174,7 +186,11 @@ namespace TouchNStars {
                             domeMediator,
                             switchMediator,
                             weatherDataMediator,
-                            plateSolverFactory);
+                            plateSolverFactory
+#if PINS
+                            , guideCameraMediator
+#endif
+                            );
 
             // Raw data for the app's histogram: tracks the prepared image and saved frame paths.
             Server.Services.RawImageService.Attach(imagingMediator, imageSaveMediator);
