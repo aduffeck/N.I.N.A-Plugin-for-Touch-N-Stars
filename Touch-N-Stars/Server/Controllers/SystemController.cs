@@ -43,6 +43,8 @@ public class SystemController : WebApiController
 
     private Dictionary<string, object> ExecuteSystemAction(SystemAction action, string successMessage)
     {
+        // No alarms for what the shutdown or restart stops; expires by itself if it fails
+        Services.Alarm.PinsAlarmService.Instance.SuppressForSystemAction();
         try
         {
             var startInfo = BuildProcessStartInfo(action);

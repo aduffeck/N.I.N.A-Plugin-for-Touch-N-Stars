@@ -63,6 +63,7 @@ namespace TouchNStars.Server {
                 .WithController<HocusFocusOptimizerController>() // HocusFocus star detection optimizer
                 .WithController<TPPAController>()        // TPPA / PolarAlignment plugin integration
                 .WithController<PinsController>()        // PINS device management
+                .WithController<PinsAlarmController>()   // PINS alarm (beep on critical events)
                 .WithController<SequenceController>()    // Sequence item discovery and management
                 .WithController<TenMicronController>()   // 10micron model builder integration
                 .WithController<LocationController>()    // Profile & mount site location
@@ -108,6 +109,7 @@ namespace TouchNStars.Server {
                         Name = "Touch-N-Stars API Thread"
                     };
                     serverThread.Start();
+                    Services.Alarm.PinsAlarmService.Instance.Start();
                     BackgroundWorker.MonitorLogForEvents();
                     BackgroundWorker.MonitorLastAF();
                     AutofocusWatcher.Start();
@@ -122,6 +124,7 @@ namespace TouchNStars.Server {
 
         public void Stop() {
             try {
+                Services.Alarm.PinsAlarmService.Instance.Stop();
                 FlatTargetNameService.Stop();
                 InternalGuiderService.Instance.StopWatching();
                 apiToken?.Cancel();

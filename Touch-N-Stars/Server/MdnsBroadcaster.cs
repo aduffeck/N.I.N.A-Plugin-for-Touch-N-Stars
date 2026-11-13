@@ -114,7 +114,7 @@ internal sealed class MdnsBroadcaster : IDisposable
         }
         catch (Exception ex)
         {
-            Logger.Error($"Failed to start mDNS multicast service: {ex}");
+            Logger.Warning($"Failed to start mDNS multicast service: {ex.Message}");
             DisposeDiscovery();
             DisposeMulticast();
             throw;
@@ -134,7 +134,7 @@ internal sealed class MdnsBroadcaster : IDisposable
         }
         catch (Exception ex)
         {
-            Logger.Error($"Failed to update mDNS advertisement: {ex}");
+            Logger.Warning($"Failed to update mDNS advertisement: {ex.Message}");
         }
     }
 

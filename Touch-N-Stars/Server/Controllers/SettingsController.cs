@@ -83,6 +83,17 @@ public class SettingsController : WebApiController
         }
     }
 
+    /// <summary>Writes a raw setting without going through the HTTP layer (alarm settings).</summary>
+    internal static void SetRawSetting(string key, string value)
+    {
+        lock (_fileLock)
+        {
+            var settings = LoadLocked();
+            settings[key] = value;
+            SaveLocked(settings);
+        }
+    }
+
     private static (DateTime Stamp, long Length) FileStamp()
     {
         var info = new FileInfo(SettingsFilePath);

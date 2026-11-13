@@ -4143,46 +4143,28 @@ public class PinsController : WebApiController
     {
         try
         {
-            var powerBox = GetPINSConnectedPowerBox();
-            if (powerBox == null)
+            // The real result: the tone may not start (no buzzer, communication error). Failures are logged as
+            // warnings only, errors raise alarms.
+            var result = Services.PinsPowerBoxAccess.TryBeep(volume, lengthMs);
+            if (result != Services.Alarm.BeepResult.Ok)
             {
-                HttpContext.Response.StatusCode = 404;
-                return new ApiResponse
+                int status = result switch
                 {
-                    Success = false,
-                    Error = "PowerBox device not connected",
-                    StatusCode = 404,
-                    Type = "Error"
+                    Services.Alarm.BeepResult.NoPowerBox => 404,
+                    Services.Alarm.BeepResult.NotSupported => 400,
+                    _ => 500
                 };
-            }
-
-            // Call the Beep method via reflection with volume and length parameters
-            var method = powerBox.GetType().GetMethod("Beep", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(int), typeof(int) }, null);
-            if (method == null)
-            {
-                HttpContext.Response.StatusCode = 400;
+                HttpContext.Response.StatusCode = status;
                 return new ApiResponse
                 {
                     Success = false,
-                    Error = "Beep method not available on PowerBox device",
-                    StatusCode = 400,
-                    Type = "Error"
-                };
-            }
-
-            try
-            {
-                method.Invoke(powerBox, new object[] { volume, lengthMs });
-            }
-            catch (Exception ex)
-            {
-                Logger.Error($"Error invoking Beep method: {ex}");
-                HttpContext.Response.StatusCode = 500;
-                return new ApiResponse
-                {
-                    Success = false,
-                    Error = $"Error calling Beep method: {ex.InnerException?.Message ?? ex.Message}",
-                    StatusCode = 500,
+                    Error = result switch
+                    {
+                        Services.Alarm.BeepResult.NoPowerBox => "PowerBox device not connected",
+                        Services.Alarm.BeepResult.NotSupported => "Beep method not available on PowerBox device",
+                        _ => "PowerBox did not start the tone (no buzzer or communication error, see log)"
+                    },
+                    StatusCode = status,
                     Type = "Error"
                 };
             }
@@ -4198,7 +4180,7 @@ public class PinsController : WebApiController
         }
         catch (Exception ex)
         {
-            Logger.Error($"Error beeping PowerBox: {ex}");
+            Logger.Warning($"Error beeping PowerBox: {ex.Message}");
             HttpContext.Response.StatusCode = 500;
             return new ApiResponse
             {

@@ -152,7 +152,24 @@ internal static class BackgroundWorker {
         return lines;
     }
 
+    /// <summary>
+    /// Reads what the watcher may have missed (a lost inotify event); called by the alarm service's poll, never
+    /// under its locks.
+    /// </summary>
+    public static void CatchUp() {
+        string path;
+        lock (logLock) {
+            path = logPath;
+        }
+        if (path != null) {
+            ProcessNewLines(path);
+        }
+    }
+
     private static void ProcessLines(List<string> lines) {
+        // Runs under logLock: the alarm service only takes the lines over
+        Alarm.PinsAlarmService.Instance.EnqueueLogLines(lines);
+
         foreach (string line in lines) {
             // "|StartAutoFocus|" catches NINA's built-in AutoFocus, which logs its failures from
             // that method. HocusFocus does not go through it — it fails in RunAutoFocus and then

@@ -133,7 +133,8 @@ namespace TouchNStars.Server.Services
                         else
                         {
                             lastError = $"Failed to connect to PHD2 at {hostname}:{4400 + instance - 1} after {maxRetries} attempts: {ex.Message}";
-                            Logger.Error($"All PHD2 connection attempts failed: {ex}");
+                            // A warning: PHD2 not running is no fault of the rig (errors raise alarms)
+                            Logger.Warning($"All PHD2 connection attempts failed: {ex.Message}");
                         }
                     }
                 }

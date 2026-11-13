@@ -54,6 +54,11 @@ namespace TouchNStars {
         IOptionsVM options,
         IAdvancedGuider internalGuider,
         IApplicationStatusMediator applicationStatus,
+        ISafetyMonitorMediator safetyMonitor = null,
+        IRotatorMediator rotator = null,
+        IDomeMediator dome = null,
+        ISwitchMediator switchMediator = null,
+        IWeatherDataMediator weatherData = null,
         IPlateSolverFactory plateSolverFactory = null) {
 
         public readonly IDeepSkyObjectSearchVM DeepSkyObjectSearchVM = DeepSkyObjectSearchVM;
@@ -80,6 +85,12 @@ namespace TouchNStars {
         public readonly IApplicationStatusMediator ApplicationStatus = applicationStatus;
         // Plate solving for the cone error measurement (never the centering solver, which syncs).
         public readonly IPlateSolverFactory PlateSolverFactory = plateSolverFactory;
+        // Watched by the alarm service (device lost, safety)
+        public readonly ISafetyMonitorMediator SafetyMonitor = safetyMonitor;
+        public readonly IRotatorMediator Rotator = rotator;
+        public readonly IDomeMediator Dome = dome;
+        public readonly ISwitchMediator Switch = switchMediator;
+        public readonly IWeatherDataMediator WeatherData = weatherData;
     }
 
     [Export(typeof(IPluginManifest))]
@@ -123,7 +134,12 @@ namespace TouchNStars {
                     IOptionsVM optionsVM,
                     IAdvancedGuider internalGuider,
                     IPlateSolverFactory plateSolverFactory,
-                    IApplicationStatusMediator applicationStatusMediator) {
+                    IApplicationStatusMediator applicationStatusMediator,
+                    ISafetyMonitorMediator safetyMonitorMediator,
+                    IRotatorMediator rotatorMediator,
+                    IDomeMediator domeMediator,
+                    ISwitchMediator switchMediator,
+                    IWeatherDataMediator weatherDataMediator) {
             if (Settings.Default.UpdateSettings) {
                 Settings.Default.Upgrade();
                 Settings.Default.UpdateSettings = false;
@@ -153,6 +169,11 @@ namespace TouchNStars {
                             optionsVM,
                             internalGuider,
                             applicationStatusMediator,
+                            safetyMonitorMediator,
+                            rotatorMediator,
+                            domeMediator,
+                            switchMediator,
+                            weatherDataMediator,
                             plateSolverFactory);
 
             // Raw data for the app's histogram: tracks the prepared image and saved frame paths.
@@ -235,6 +256,8 @@ namespace TouchNStars {
 
 
         public override Task Teardown() {
+            // No alarm for what the shutdown disconnects
+            Server.Services.Alarm.PinsAlarmService.Instance.BeginShutdown();
             server?.Stop();
             StopMdnsAdvertisement();
             mdnsBroadcaster?.Dispose();
@@ -375,7 +398,8 @@ namespace TouchNStars {
                 mdnsBroadcaster ??= new MdnsBroadcaster(MdnsServiceType);
                 mdnsBroadcaster.StartOrUpdate(MdnsServiceInstance, CachedPort, address, txtProperties);
             } catch (Exception ex) {
-                Logger.Error($"Failed to advertise Touch 'N' Stars via mDNS: {ex}");
+                // A warning, not an error: the app finds the box by its address as well, and errors raise alarms
+                Logger.Warning($"Failed to advertise Touch 'N' Stars via mDNS: {ex.Message}");
             }
         }
 
