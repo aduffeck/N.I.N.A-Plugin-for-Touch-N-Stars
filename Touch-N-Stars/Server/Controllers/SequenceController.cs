@@ -2377,6 +2377,13 @@ namespace TouchNStars.Server.Controllers
         /// propertyName: Name of the property to set (supports nested properties with dot notation, e.g., "Target.PositionAngle")
         /// value: New value (as string, will be converted to proper type)
         /// </summary>
+        // The sequencer runs this entity, so a write to its status would replace Running.
+        private ApiResponse RunningConflict(string error)
+        {
+            HttpContext.Response.StatusCode = 409;
+            return new ApiResponse { Success = false, Error = error, StatusCode = 409, Type = "Error" };
+        }
+
         [Route(HttpVerbs.Post, "/sequence/set")]
         public ApiResponse SetObjectProperty([QueryField] string id, [QueryField] string propertyName, [QueryField] string value)
         {
@@ -2397,8 +2404,16 @@ namespace TouchNStars.Server.Controllers
 
                 try
                 {
+                    bool refused = false;
                     Application.Current.Dispatcher.Invoke(() =>
                     {
+                        if (string.Equals(propertyName, "Status", StringComparison.OrdinalIgnoreCase)
+                            && SequenceResetGuard.IsRunning(obj))
+                        {
+                            refused = true;
+                            return;
+                        }
+
                         // Handle flat aliases for WaitLoopData fields (mirrors GetPropertyInfo flattening).
                         // "TargetAltitude" -> "Data.Offset"  (the persistent user-settable value; Data.TargetAltitude
                         //   is computed and gets overwritten by CalculateExpectedTime on every Check() call).
@@ -2525,6 +2540,11 @@ namespace TouchNStars.Server.Controllers
 
                         Logger.Debug($"Property '{propertyName}' set to '{value}' on type '{obj.GetType().Name}'");
                     });
+
+                    if (refused)
+                    {
+                        return RunningConflict("Cannot change the status of an item while the sequence runs it");
+                    }
 
                     HttpContext.Response.StatusCode = 200;
                     return new ApiResponse
@@ -2890,8 +2910,16 @@ namespace TouchNStars.Server.Controllers
 
                 try
                 {
+                    bool refused = false;
                     Application.Current.Dispatcher.Invoke(() =>
                     {
+                        // Enabling writes Created and disabling Disabled, either would replace Running.
+                        if (SequenceResetGuard.IsRunning(obj))
+                        {
+                            refused = true;
+                            return;
+                        }
+
                         // Use the Status property: DISABLED when disabled, CREATED when enabled
                         // Works for all sequence items including containers (Sequential, Parallel, Target)
                         var statusProp = obj.GetType().GetProperty("Status", BindingFlags.IgnoreCase | BindingFlags.Public | BindingFlags.Instance);
@@ -2936,6 +2964,11 @@ namespace TouchNStars.Server.Controllers
                             throw new Exception($"Object of type '{obj.GetType().Name}' (ID: {id}) does not have a writable 'Status' property");
                         }
                     });
+
+                    if (refused)
+                    {
+                        return RunningConflict("Cannot enable or disable an item while the sequence runs it");
+                    }
 
                     HttpContext.Response.StatusCode = 200;
                     return new ApiResponse
@@ -2998,22 +3031,17 @@ namespace TouchNStars.Server.Controllers
                     // Only reset if it's a sequence item
                     if (obj is ISequenceItem item)
                     {
-                        // A running item (or a container that holds one) stays as it is: its reset
-                        // would set it to Created while the sequence still executes it.
-                        if (SequenceResetGuard.IsRunning(item))
-                        {
-                            HttpContext.Response.StatusCode = 409;
-                            return new ApiResponse
-                            {
-                                Success = false,
-                                Error = "Cannot reset an item while the sequence runs it",
-                                StatusCode = 409,
-                                Type = "Error"
-                            };
-                        }
-
+                        bool refused = false;
                         Application.Current.Dispatcher.Invoke(() =>
                         {
+                            // A running item (or a container that holds one) stays as it is: its reset
+                            // would set it to Created while the sequence still executes it.
+                            if (SequenceResetGuard.IsRunning(item))
+                            {
+                                refused = true;
+                                return;
+                            }
+
                             // Match WPF ResetProgressCommand behavior: reset only this item (and its
                             // children if it is a container), then cascade the status change upward
                             // to parent containers.  Do NOT reset subsequent siblings.
@@ -3023,6 +3051,11 @@ namespace TouchNStars.Server.Controllers
                             }
                             item.ResetProgressCascaded();
                         });
+
+                        if (refused)
+                        {
+                            return RunningConflict("Cannot reset an item while the sequence runs it");
+                        }
                     }
 
                     HttpContext.Response.StatusCode = 200;
@@ -3205,6 +3238,12 @@ namespace TouchNStars.Server.Controllers
                     {
                         HttpContext.Response.StatusCode = 400;
                         return new ApiResponse { Success = false, Error = "No sequence loaded", StatusCode = 400, Type = "Error" };
+                    }
+
+                    // As in ninaAPI: a reset of the whole sequence would set what runs to Created.
+                    if (sequenceMediator.IsAdvancedSequenceRunning())
+                    {
+                        return RunningConflict("Cannot reset the sequence while it is running");
                     }
 
                     Application.Current.Dispatcher.Invoke(() =>
