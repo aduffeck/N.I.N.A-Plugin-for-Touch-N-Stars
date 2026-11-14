@@ -20,6 +20,7 @@ using System.Reflection;
 using System.Windows;
 using System.Windows.Input;
 using TouchNStars.Server.Models;
+using TouchNStars.Server.Services;
 using Newtonsoft.Json;
 using System.Threading.Tasks;
 using System.Collections;
@@ -2997,6 +2998,20 @@ namespace TouchNStars.Server.Controllers
                     // Only reset if it's a sequence item
                     if (obj is ISequenceItem item)
                     {
+                        // A running item (or a container that holds one) stays as it is: its reset
+                        // would set it to Created while the sequence still executes it.
+                        if (SequenceResetGuard.IsRunning(item))
+                        {
+                            HttpContext.Response.StatusCode = 409;
+                            return new ApiResponse
+                            {
+                                Success = false,
+                                Error = "Cannot reset an item while the sequence runs it",
+                                StatusCode = 409,
+                                Type = "Error"
+                            };
+                        }
+
                         Application.Current.Dispatcher.Invoke(() =>
                         {
                             // Match WPF ResetProgressCommand behavior: reset only this item (and its
