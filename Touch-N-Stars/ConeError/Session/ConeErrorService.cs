@@ -573,6 +573,18 @@ public sealed class ConeErrorService
         return new SessionStatus { RestorePending = Store.LoadJournal() != null };
     }
 
+    /// <summary>Whether a measurement or a daytime check runs, without the heartbeat <see cref="Status"/> sends.</summary>
+    public bool IsActive
+    {
+        get
+        {
+            lock (sync)
+            {
+                return IsSessionActive();
+            }
+        }
+    }
+
     /// <summary>Stops the mount at once and ends whatever runs (restores on the way out).</summary>
     public SessionStatus Abort()
     {

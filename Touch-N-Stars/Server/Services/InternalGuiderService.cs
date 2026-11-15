@@ -92,6 +92,12 @@ public sealed class InternalGuiderService
     /// <summary>True while a start-guiding call slews to the calibration position (before its calibration).</summary>
     public bool CalibrationSlewInProgress => Volatile.Read(ref calibrationSlewRunning) != 0;
 
+    /// <summary>
+    /// True while a guiding start issued through this API (calibration slew, calibration, settling) or a Guiding Coach
+    /// start slew runs; <see cref="CancelGuidingStart"/> ends both.
+    /// </summary>
+    public bool GuidingStartInProgress => Volatile.Read(ref guidingStartCts) != null || Volatile.Read(ref coachSlewRunning) != 0;
+
     /// <summary>True while a dark library build started through this API runs.</summary>
     public bool DarksInProgress => Volatile.Read(ref darksCts) != null;
 

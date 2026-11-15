@@ -2,8 +2,15 @@ using NINA.Core.Utility;
 using NINA.Equipment.Interfaces;
 using NINA.Equipment.Interfaces.Mediator;
 using NINA.Sequencer.Interfaces.Mediator;
+using TouchNStars.ConeError.Session;
+using TouchNStars.Server.Controllers;
+using TouchNStars.Server.Infrastructure;
+#if PINS
+using NINA.Equipment.Equipment.MyGuider.Advanced;
+#endif
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -11,6 +18,12 @@ namespace TouchNStars.Server.Services;
 
 /// <summary>A device the shutdown can disconnect at the end.</summary>
 internal sealed record RigDevice(string Name, Func<Task> Disconnect);
+
+/// <summary>
+/// A job besides the advanced sequence that holds the camera, focuser, flat panel or mount (autofocus, flats, ...).
+/// The shutdown stops it before it moves hardware, so it does not take a device away in the middle of a run.
+/// </summary>
+internal sealed record RigActivity(string Name, Func<bool> IsRunning, Func<Task> Stop);
 
 /// <summary>
 /// The parts of the rig the end-of-night shutdown reads and moves. An interface so that the order of the steps and
@@ -21,6 +34,9 @@ internal interface ISecureObservatoryRig
 {
     bool IsSequenceRunning();
     void StopSequence();
+
+    /// <summary>The jobs besides the sequence that run now.</summary>
+    IReadOnlyList<RigActivity> RunningActivities();
 
     bool CameraConnected();
     bool CameraExposing();
@@ -36,6 +52,13 @@ internal interface ISecureObservatoryRig
 
     bool MountConnected();
     bool MountParked();
+
+    /// <summary>
+    /// False for mounts without a park position: NINA's park then slews to the pole and stops tracking, and the
+    /// mount never reports parked.
+    /// </summary>
+    bool MountCanPark();
+    bool MountTracking();
     Task<bool> ParkMount(CancellationToken token);
 
     bool DomeConnected();
@@ -79,6 +102,33 @@ internal sealed class MediatorSecureObservatoryRig : ISecureObservatoryRig
         }
     }
 
+    public IReadOnlyList<RigActivity> RunningActivities()
+    {
+        var activities = new List<RigActivity>
+        {
+            // The filter offset calibration first: it would start the next filter's autofocus after this one ends.
+            new("filter offset calibration", () => FilterOffsetController.IsCalculationRunning, () => { FilterOffsetController.RequestStop(); return Task.CompletedTask; }),
+            new("autofocus", AutofocusController.IsAutofocusRunning, AutofocusController.CancelAutofocusAsync),
+            new("flats", () => FlatWizardService.IsRunning, () => { FlatWizardService.Stop(); return Task.CompletedTask; }),
+            new("cone error measurement", () => ConeErrorService.Instance.IsActive, () => { ConeErrorService.Instance.Abort(); return Task.CompletedTask; }),
+        };
+#if PINS
+        // A calibration slew, or the Guiding Coach's start slew, would run alongside the park and then start guiding
+        // on the parked mount; stopping guiding does not end them.
+        activities.Add(new("guiding start", () => InternalGuiderService.Instance.GuidingStartInProgress,
+            () => { InternalGuiderService.Instance.CancelGuidingStart(); return Task.CompletedTask; }));
+        activities.Add(new("guider dark library", () => InternalGuiderService.Instance.DarksInProgress,
+            () => { InternalGuiderService.Instance.CancelDarks(); return Task.CompletedTask; }));
+        if (InternalGuiderService.Instance.GetConnectedGuider(out _) is IGuidingCoach coach)
+        {
+            activities.Add(new("guiding coach",
+                () => InternalGuiderStates.IsCoachRunning(InternalGuiderService.GetCoachStatus(coach)),
+                () => InternalGuiderService.Instance.CancelCoachAsync(coach)));
+        }
+#endif
+        return activities.Where(activity => activity.IsRunning()).ToList();
+    }
+
     public bool CameraConnected() => M.Camera?.GetInfo()?.Connected == true;
 
     public bool CameraExposing() => M.Camera?.GetInfo() is { Connected: true, IsExposing: true };
@@ -87,8 +137,13 @@ internal sealed class MediatorSecureObservatoryRig : ISecureObservatoryRig
 
     public bool CameraCoolerOn() => M.Camera?.GetInfo() is { Connected: true, CanSetTemperature: true, CoolerOn: true };
 
-    // The camera view model's flag: CameraInfo.TempChangeRunning is not set by every NINA build.
+#if PINS
+    // The camera view model's flag (a pins addition to ICameraMediator): CameraInfo.TempChangeRunning is never set.
     public bool CameraTemperatureRampRunning() => M.Camera?.TempChangeRunning == true;
+#else
+    // NINA 3.1 has no way to tell; WarmCamera then takes over the running ramp.
+    public bool CameraTemperatureRampRunning() => false;
+#endif
 
     public Task<bool> WarmCamera(TimeSpan duration, CancellationToken token) =>
         M.Camera.WarmCamera(duration, new Progress<NINA.Core.Model.ApplicationStatus>(), token);
@@ -100,6 +155,10 @@ internal sealed class MediatorSecureObservatoryRig : ISecureObservatoryRig
     public bool MountConnected() => M.Telescope?.GetInfo()?.Connected == true;
 
     public bool MountParked() => M.Telescope?.GetInfo() is { Connected: true, AtPark: true };
+
+    public bool MountCanPark() => M.Telescope?.GetInfo() is { Connected: true, CanPark: true };
+
+    public bool MountTracking() => M.Telescope?.GetInfo() is { Connected: true, TrackingEnabled: true };
 
     public Task<bool> ParkMount(CancellationToken token) =>
         M.Telescope.ParkTelescope(new Progress<NINA.Core.Model.ApplicationStatus>(), token);

@@ -304,6 +304,21 @@ public partial class FilterOffsetController : WebApiController
         };
     }
 
+    /// <summary>True while a calibration measures (not while it waits for the user to take the result).</summary>
+    internal static bool IsCalculationRunning
+    {
+        get { lock (_stateLock) return _state == "Running"; }
+    }
+
+    /// <summary>Stops a running calibration, like GET /filter-offset/stop.</summary>
+    internal static void RequestStop()
+    {
+        lock (_stateLock)
+        {
+            _cts?.Cancel();
+        }
+    }
+
     // ── GET /api/filter-offset/stop ──────────────────────────────────────────
     [Route(HttpVerbs.Get, "/filter-offset/stop")]
     public ApiResponse StopCalculation()
@@ -879,7 +894,7 @@ public partial class FilterOffsetController : WebApiController
     // makes it the one externally-observable signal that means "safe to switch to the next filter now".
     // Returns null (and doesn't block) if HocusFocus isn't loaded or the property can't be read, so this
     // degrades gracefully rather than hanging the calibration on an unrelated AF backend.
-    private static bool? IsHocusFocusAutoFocusInProgress()
+    internal static bool? IsHocusFocusAutoFocusInProgress()
     {
         try
         {

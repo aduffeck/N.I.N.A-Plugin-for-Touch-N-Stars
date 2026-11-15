@@ -124,6 +124,28 @@ public class AutofocusController : WebApiController
         return new Dictionary<string, object>() { { "error", "Ungültige Anfrage" } };
     }
 
+    /// <summary>
+    /// Whether an autofocus runs. HocusFocus' own flag when it can be read: it stays set through the clean-up after
+    /// the run (focuser return, filter restore, guiding restart), while afRun clears before it. afRun otherwise.
+    /// </summary>
+    internal static bool IsAutofocusRunning()
+        => FilterOffsetController.IsHocusFocusAutoFocusInProgress() ?? DataContainer.afRun;
+
+    /// <summary>
+    /// Asks the Advanced API to cancel its autofocus. A refusal is only logged: it also comes when the autofocus was
+    /// started elsewhere (pins MCP, a sequence) or has ended; the caller decides from <see cref="IsAutofocusRunning"/>.
+    /// </summary>
+    internal static async Task CancelAutofocusAsync()
+    {
+        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+        HttpResponseMessage response = await client.GetAsync(await AutofocusUrl() + "?cancel=true");
+        ApiResponse apiResponse = response.IsSuccessStatusCode ? await response.Content.ReadFromJsonAsync<ApiResponse>() : null;
+        if (apiResponse?.Success != true)
+        {
+            Logger.Warning($"TNS: the Advanced API did not cancel an autofocus: {apiResponse?.Error ?? response.StatusCode.ToString()}");
+        }
+    }
+
     private static async Task<string> AutofocusUrl()
     {
         return $"{await CoreUtility.GetApiUrl()}/equipment/focuser/auto-focus";

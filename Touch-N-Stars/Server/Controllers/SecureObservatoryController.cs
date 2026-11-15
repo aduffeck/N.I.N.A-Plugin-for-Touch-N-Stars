@@ -95,10 +95,16 @@ internal static class ImageDisk
         long? free = null;
         long? total = null;
 
+        // No space for a missing folder: its parent would often be the SD card, e.g. while a USB drive is unmounted.
+        if (!exists)
+        {
+            return new { path, exists, freeBytes = free, totalBytes = total };
+        }
+
         try
         {
             // On Linux DriveInfo takes any path and reports the file system it lives on.
-            var drive = new DriveInfo(exists ? path : Path.GetPathRoot(Path.GetFullPath(path)));
+            var drive = new DriveInfo(path);
             if (drive.IsReady)
             {
                 free = drive.AvailableFreeSpace;

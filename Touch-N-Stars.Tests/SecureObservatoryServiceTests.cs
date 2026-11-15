@@ -43,7 +43,20 @@ public class SecureObservatoryServiceTests
         public bool CoverClosed;
         public bool HasLight = true;
         public bool Light = true;
+        public bool CanPark = true;
+        public bool Tracking = true;
+        public bool ParkSwallowsCancel;
+        public bool DomeCloseTimesOut;
+        public readonly List<FakeActivity> Activities = [];
 
+        public IReadOnlyList<RigActivity> RunningActivities() =>
+            Activities.Where(a => a.Running).Select(a => new RigActivity(a.Name, () => a.Running, () =>
+            {
+                Calls.Add($"stop {a.Name}");
+                if (a.StopThrows) throw new InvalidOperationException("refused");
+                if (!a.IgnoresStop) a.Running = false;
+                return Task.CompletedTask;
+            })).ToList();
         public bool IsSequenceRunning() => SequenceRunning;
         public void StopSequence() { Calls.Add("stop_sequence"); if (!SequenceIgnoresStop) SequenceRunning = false; }
         public bool CameraConnected() => CameraOn;
@@ -56,18 +69,38 @@ public class SecureObservatoryServiceTests
         public Task<bool> StopGuiding(CancellationToken token) { Calls.Add("stop_guiding"); return Task.FromResult(true); }
         public bool MountConnected() => MountOn;
         public bool MountParked() => MountOn && Parked;
+        public bool MountCanPark() => MountOn && CanPark;
+        public bool MountTracking() => MountOn && Tracking;
         public async Task<bool> ParkMount(CancellationToken token)
         {
             Calls.Add("park");
             if (ParkThrows) throw new InvalidOperationException("driver error");
-            if (ParkGate != null) await ParkGate.Task.WaitAsync(token);
+            if (ParkGate != null)
+            {
+                try { await ParkGate.Task.WaitAsync(token); }
+                // NINA's TelescopeVM catches the cancel and returns false.
+                catch (OperationCanceledException) when (ParkSwallowsCancel) { return false; }
+            }
+            if (!CanPark)
+            {
+                // As NINA does for a mount without a park position: pole, tracking off, never AtPark, and the result
+                // is the new tracking state, false.
+                Tracking = !ParkResult;
+                return false;
+            }
             if (ParkResult) Parked = true;
             return ParkResult;
         }
         public bool DomeConnected() => DomeOn;
         public bool DomeCanSetShutter() => DomeOn && DomeShutterControl;
         public ShutterState DomeShutter() => Shutter;
-        public Task<bool> CloseDome(CancellationToken token) { Calls.Add("close_dome"); if (DomeCloseWorks) Shutter = ShutterState.ShutterClosed; return Task.FromResult(true); }
+        public async Task<bool> CloseDome(CancellationToken token)
+        {
+            Calls.Add("close_dome");
+            if (DomeCloseTimesOut) await Task.Delay(Timeout.Infinite, token);
+            if (DomeCloseWorks) Shutter = ShutterState.ShutterClosed;
+            return true;
+        }
         public bool FlatDeviceConnected() => FlatOn;
         public bool FlatDeviceHasCover() => FlatOn && HasCover;
         public bool FlatDeviceCoverClosed() => CoverClosed;
@@ -85,9 +118,18 @@ public class SecureObservatoryServiceTests
         }
     }
 
+    private sealed class FakeActivity(string name)
+    {
+        public string Name = name;
+        public bool Running = true;
+        public bool IgnoresStop;
+        public bool StopThrows;
+    }
+
     private static SecureObservatoryService Service(FakeRig rig) => new(rig)
     {
         SequenceStopGrace = TimeSpan.FromMilliseconds(300),
+        ActivityStopGrace = TimeSpan.FromMilliseconds(300),
         StateSettleTimeout = TimeSpan.FromMilliseconds(100),
         PollInterval = TimeSpan.FromMilliseconds(5),
     };
@@ -109,7 +151,8 @@ public class SecureObservatoryServiceTests
         var status = await RunToEnd(Service(rig));
 
         Assert.Equal(SecureRunState.Done, status.State);
-        Assert.All(status.Steps, step => Assert.Equal(SecureStepState.Done, step.State));
+        Assert.All(status.Steps.Where(step => step.Id != SecureObservatoryService.StopActivities), step => Assert.Equal(SecureStepState.Done, step.State));
+        Assert.Equal(SecureStepState.Skipped, StepOf(status, SecureObservatoryService.StopActivities).State);
         Assert.Equal(
             ["stop_sequence", "abort_exposure", "stop_guiding", "park", "close_dome", "light_off", "close_cover", "warm 10", "disconnect guider", "disconnect camera", "disconnect mount"],
             rig.Calls);
@@ -124,7 +167,7 @@ public class SecureObservatoryServiceTests
 
         var status = await RunToEnd(Service(rig), new SecureObservatoryOptions { Park = false, CloseDome = false, CloseCover = false, WarmCamera = false, Disconnect = false });
 
-        Assert.Equal([SecureObservatoryService.StopSequence, SecureObservatoryService.AbortExposure, SecureObservatoryService.StopGuiding], status.Steps.Select(step => step.Id));
+        Assert.Equal([SecureObservatoryService.StopSequence, SecureObservatoryService.StopActivities, SecureObservatoryService.AbortExposure, SecureObservatoryService.StopGuiding], status.Steps.Select(step => step.Id));
         Assert.Equal(["stop_guiding"], rig.Calls);
         Assert.Equal(SecureRunState.Done, status.State);
     }
@@ -294,6 +337,130 @@ public class SecureObservatoryServiceTests
 
         rig.ParkResult = true;
         Assert.Equal(SecureRunState.Done, (await RunToEnd(service)).State);
+    }
+
+    [Fact]
+    public async Task MountWithoutParkPosition_CountsAsDoneWithoutADome()
+    {
+        var rig = new FakeRig { CanPark = false, DomeOn = false };
+
+        var status = await RunToEnd(Service(rig));
+
+        Assert.Equal(SecureStepState.Done, StepOf(status, SecureObservatoryService.ParkMount).State);
+        Assert.Contains("no park position", StepOf(status, SecureObservatoryService.ParkMount).Message);
+        Assert.Equal(SecureRunState.Done, status.State);
+        Assert.Contains("disconnect mount", rig.Calls);
+    }
+
+    [Fact]
+    public async Task MountWithoutParkPosition_KeepsTheDomeOpen()
+    {
+        var rig = new FakeRig { CanPark = false };
+
+        var status = await RunToEnd(Service(rig));
+
+        Assert.Equal(SecureStepState.Done, StepOf(status, SecureObservatoryService.ParkMount).State);
+        Assert.Equal(SecureStepState.Failed, StepOf(status, SecureObservatoryService.CloseDome).State);
+        Assert.Contains("no park position", StepOf(status, SecureObservatoryService.CloseDome).Message);
+        Assert.DoesNotContain("close_dome", rig.Calls);
+        Assert.Equal(SecureStepState.Skipped, StepOf(status, SecureObservatoryService.Disconnect).State);
+    }
+
+    [Fact]
+    public async Task RunningJobsAreStoppedBeforeHardwareMoves()
+    {
+        var rig = new FakeRig();
+        rig.Activities.Add(new FakeActivity("autofocus"));
+        rig.Activities.Add(new FakeActivity("flats"));
+        rig.Activities.Add(new FakeActivity("guiding coach") { Running = false });
+
+        var status = await RunToEnd(Service(rig));
+
+        Assert.Equal(SecureStepState.Done, StepOf(status, SecureObservatoryService.StopActivities).State);
+        Assert.Equal("Stopped: autofocus, flats.", StepOf(status, SecureObservatoryService.StopActivities).Message);
+        Assert.True(rig.Calls.IndexOf("stop flats") < rig.Calls.IndexOf("park"));
+        Assert.DoesNotContain("stop guiding coach", rig.Calls);
+        Assert.Equal(SecureRunState.Done, status.State);
+    }
+
+    [Fact]
+    public async Task AJobThatKeepsRunningIsReportedAndKeepsTheDevicesConnected()
+    {
+        var rig = new FakeRig();
+        rig.Activities.Add(new FakeActivity("flats") { IgnoresStop = true });
+        rig.Activities.Add(new FakeActivity("autofocus") { StopThrows = true });
+
+        var status = await RunToEnd(Service(rig));
+
+        var step = StepOf(status, SecureObservatoryService.StopActivities);
+        Assert.Equal(SecureStepState.Failed, step.State);
+        Assert.Contains("flats", step.Message);
+        Assert.Contains("autofocus", step.Message);
+        Assert.Contains("park", rig.Calls);
+        Assert.Equal(SecureStepState.Skipped, StepOf(status, SecureObservatoryService.Disconnect).State);
+    }
+
+    [Fact]
+    public async Task DomeCloseTimeoutAfterACancelIsAFailure()
+    {
+        var rig = new FakeRig { Parked = true, DomeCloseTimesOut = true };
+        var service = Service(rig);
+        service.DomeCloseTimeout = TimeSpan.FromMilliseconds(300);
+
+        service.Start(new SecureObservatoryOptions());
+        await WaitUntil(() => rig.Calls.Contains("close_dome"));
+        service.Cancel();
+        await service.Run.WaitAsync(TimeSpan.FromSeconds(10));
+
+        var status = service.GetStatus();
+        var dome = StepOf(status, SecureObservatoryService.CloseDome);
+        Assert.Equal(SecureStepState.Failed, dome.State);
+        Assert.Contains("did not close within", dome.Message);
+        // A failed step outweighs the cancel: the dome can be open.
+        Assert.Equal(SecureRunState.Failed, status.State);
+    }
+
+    [Fact]
+    public async Task MountWithoutParkPosition_StillTrackingFails()
+    {
+        var rig = new FakeRig { CanPark = false, DomeOn = false, ParkResult = false };
+
+        var status = await RunToEnd(Service(rig));
+
+        Assert.Equal(SecureStepState.Failed, StepOf(status, SecureObservatoryService.ParkMount).State);
+        Assert.Contains("still tracks", StepOf(status, SecureObservatoryService.ParkMount).Message);
+        Assert.Equal(SecureStepState.Skipped, StepOf(status, SecureObservatoryService.Disconnect).State);
+    }
+
+    [Fact]
+    public async Task CancelDuringAParkThatSwallowsIt_IsCancelledNotFailed()
+    {
+        var rig = new FakeRig { ParkGate = new TaskCompletionSource<bool>(), ParkSwallowsCancel = true };
+        var service = Service(rig);
+
+        service.Start(new SecureObservatoryOptions());
+        await WaitUntil(() => rig.Calls.Contains("park"));
+        service.Cancel();
+        await service.Run.WaitAsync(TimeSpan.FromSeconds(10));
+
+        var status = service.GetStatus();
+        Assert.Equal(SecureStepState.Skipped, StepOf(status, SecureObservatoryService.ParkMount).State);
+        Assert.Equal(SecureRunState.Cancelled, status.State);
+    }
+
+    [Fact]
+    public void ImageDisk_ReportsNoSpaceForAMissingFolder()
+    {
+        string missing = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "tns-missing-" + Guid.NewGuid());
+
+        var json = JObject.FromObject(ImageDisk.Read(missing));
+
+        Assert.False((bool)json["exists"]!);
+        Assert.Equal(JTokenType.Null, json["freeBytes"]!.Type);
+
+        var existing = JObject.FromObject(ImageDisk.Read(System.IO.Path.GetTempPath()));
+        Assert.True((bool)existing["exists"]!);
+        Assert.True((long)existing["freeBytes"]! > 0);
     }
 
     [Fact]

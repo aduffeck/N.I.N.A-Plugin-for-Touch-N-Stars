@@ -59,9 +59,11 @@ public sealed class SecureObservatoryStatus
 /// The end-of-night shutdown behind Touch-N-Stars' "End night" button. It runs on the server, so that a phone that
 /// loses Wi-Fi or goes to sleep halfway does not leave the mount unparked with the roof open.
 ///
-/// In this order: stop the advanced sequence (and wait for it to end), abort the exposure, stop guiding, park the
-/// mount, close the dome shutter (only over a parked mount), close the flat panel's cover and switch its light off,
-/// warm the camera, disconnect every device. Steps for devices that are not connected are skipped. Devices stay
+/// In this order: stop the advanced sequence (and wait for it to end), stop the other jobs that hold devices
+/// (filter offset calibration, autofocus, flats, cone error measurement, guiding start, guider dark library, Guiding
+/// Coach; not a lucky capture recording), abort the exposure, stop guiding, park the mount, close
+/// the dome shutter (only over a parked mount), close the flat panel's cover and switch its light off, warm the
+/// camera, disconnect every device. Steps for devices that are not connected are skipped. Devices stay
 /// connected when an earlier step failed, so the user can still fix it from the app.
 /// </summary>
 public sealed class SecureObservatoryService
@@ -69,6 +71,7 @@ public sealed class SecureObservatoryService
     public static SecureObservatoryService Instance { get; } = new(new MediatorSecureObservatoryRig());
 
     public const string StopSequence = "stop_sequence";
+    public const string StopActivities = "stop_activities";
     public const string AbortExposure = "abort_exposure";
     public const string StopGuiding = "stop_guiding";
     public const string ParkMount = "park_mount";
@@ -94,6 +97,9 @@ public sealed class SecureObservatoryService
 
     /// <summary>How long the stopped sequence gets to end before hardware moves.</summary>
     internal TimeSpan SequenceStopGrace { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>How long stopped jobs (autofocus, flats, ...) get to end before hardware moves.</summary>
+    internal TimeSpan ActivityStopGrace { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>Upper bound for closing the dome, which a cancel never interrupts (a half-open roof is worse).</summary>
     internal TimeSpan DomeCloseTimeout { get; set; } = TimeSpan.FromMinutes(10);
@@ -168,7 +174,7 @@ public sealed class SecureObservatoryService
 
     private static List<SecureStepStatus> PlanSteps(SecureObservatoryOptions options)
     {
-        var planned = new List<string> { StopSequence, AbortExposure, StopGuiding };
+        var planned = new List<string> { StopSequence, StopActivities, AbortExposure, StopGuiding };
         if (options.Park) planned.Add(ParkMount);
         if (options.CloseDome) planned.Add(CloseDome);
         if (options.CloseCover) planned.Add(CloseCover);
@@ -183,6 +189,7 @@ public sealed class SecureObservatoryService
         try
         {
             await Step(StopSequence, () => StopSequenceAsync(token), token);
+            await Step(StopActivities, () => StopActivitiesAsync(token), token);
             await Step(AbortExposure, () => Task.FromResult(AbortExposureStep()), token);
             await Step(StopGuiding, () => StopGuidingAsync(token), token);
 
@@ -218,7 +225,8 @@ public sealed class SecureObservatoryService
                 step.Message = "Cancelled.";
             }
 
-            state = forced ?? (steps.Any(step => step.State == SecureStepState.Failed) ? SecureRunState.Failed : SecureRunState.Done);
+            // A failed step outweighs a cancel: the dome can be open after a Stop.
+            state = steps.Any(step => step.State == SecureStepState.Failed) ? SecureRunState.Failed : forced ?? SecureRunState.Done;
             finishedAt = DateTime.UtcNow;
         }
 
@@ -303,6 +311,41 @@ public sealed class SecureObservatoryService
         return StepResult.Ok("Sequence stopped.");
     }
 
+    private async Task<StepResult> StopActivitiesAsync(CancellationToken token)
+    {
+        var running = rig.RunningActivities();
+        if (running.Count == 0)
+        {
+            return StepResult.Skip("Nothing else is running.");
+        }
+
+        var failed = new List<string>();
+        foreach (var activity in running)
+        {
+            try
+            {
+                await activity.Stop();
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"TNS: stopping the {activity.Name} failed: {ex}");
+                failed.Add(activity.Name);
+            }
+        }
+
+        DateTime deadline = DateTime.UtcNow + ActivityStopGrace;
+        while (running.Any(activity => activity.IsRunning()) && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(PollInterval, token);
+        }
+
+        var stillRunning = running.Where(activity => activity.IsRunning()).Select(activity => activity.Name).Union(failed).ToList();
+        string names = string.Join(", ", running.Select(activity => activity.Name));
+        return stillRunning.Count == 0
+            ? StepResult.Ok($"Stopped: {names}.")
+            : StepResult.Fail($"Still running after the stop: {string.Join(", ", stillRunning)}; the shutdown went on.");
+    }
+
     private StepResult AbortExposureStep()
     {
         if (!rig.CameraExposing())
@@ -338,7 +381,26 @@ public sealed class SecureObservatoryService
             return StepResult.Ok("Mount was already parked.");
         }
 
-        if (!await rig.ParkMount(token))
+        bool canPark = rig.MountCanPark();
+        bool parkReported = await rig.ParkMount(token);
+
+        // NINA swallows a cancel of the park and returns false.
+        if (token.IsCancellationRequested)
+        {
+            return StepResult.Skip("Cancelled.");
+        }
+
+        // NINA's park of a mount without a park position: a slew to the pole and tracking off. Its result is the
+        // tracking state, false after a successful stop, so only the mount's state tells. It never reports parked,
+        // so the dome step still refuses to close over it.
+        if (!canPark)
+        {
+            return await WaitFor(() => !rig.MountTracking(), token)
+                ? StepResult.Ok("This mount has no park position: it now points at the pole with tracking off.")
+                : StepResult.Fail("This mount has no park position, and it still tracks after the slew to the pole; the log has details.");
+        }
+
+        if (!parkReported)
         {
             return StepResult.Fail("The mount could not be parked; the log has details.");
         }
@@ -368,13 +430,26 @@ public sealed class SecureObservatoryService
 
         if (!mountParked)
         {
-            return StepResult.Fail(rig.MountConnected()
-                ? "Not closed: the mount is not parked, and closing the dome over an unparked telescope can damage it. Park the mount, then close the dome."
-                : "Not closed: no mount is connected, so it is unknown whether the telescope is clear. Check it, then close the dome by hand.");
+            return StepResult.Fail(!rig.MountConnected()
+                ? "Not closed: no mount is connected, so it is unknown whether the telescope is clear. Check it, then close the dome by hand."
+                : !rig.MountCanPark()
+                    ? "Not closed: this mount has no park position, so it is unknown whether the telescope is clear of the dome. Check it, then close the dome by hand."
+                    : "Not closed: the mount is not parked, and closing the dome over an unparked telescope can damage it. Park the mount, then close the dome.");
         }
 
         using var timeout = new CancellationTokenSource(DomeCloseTimeout);
-        if (!await rig.CloseDome(timeout.Token))
+        bool closed;
+        try
+        {
+            closed = await rig.CloseDome(timeout.Token);
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            // Only the timeout can end the close; it must not read as "cancelled" when the user also pressed Stop.
+            return StepResult.Fail($"The shutter did not close within {DomeCloseTimeout.TotalMinutes:0} minutes (state {rig.DomeShutter()}). Check the dome.");
+        }
+
+        if (!closed)
         {
             return StepResult.Fail($"The shutter did not close (state {rig.DomeShutter()}); the log has details.");
         }
