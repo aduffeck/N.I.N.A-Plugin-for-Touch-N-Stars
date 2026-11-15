@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using NINA.Core.Utility;
@@ -23,6 +24,17 @@ internal sealed class AvahiServicePublisher
     private static readonly TimeSpan HealthyRun = TimeSpan.FromMinutes(2);
     private const int KeptErrorLines = 5;
 
+    private const string PublisherPath = "/usr/bin/avahi-publish-service";
+    private const string ShellPath = "/bin/bash";
+
+    // A child gets every descriptor of NINA that was opened without close-on-exec, e.g. a serial port a native device
+    // SDK is probing at that moment. The publisher lives as long as NINA: it kept such a port open and with it the
+    // port's exclusive flag, so nothing could open the port again until the device was replugged. The shell closes all
+    // descriptors but stdin, stdout and stderr and then becomes avahi-publish-service (same process id).
+    internal const string CloseDescriptorsAndRunPublisher =
+        "for fd in /proc/$$/fd/*; do fd=${fd##*/}; case $fd in *[!0-9]*) continue;; esac; "
+        + "[ \"$fd\" -gt 2 ] && eval \"exec $fd>&-\"; done; exec " + PublisherPath + " \"$@\"";
+
     private readonly object gate = new();
     private readonly Queue<string> recentErrors = new();
     private Process publisher;
@@ -37,13 +49,17 @@ internal sealed class AvahiServicePublisher
     internal static ProcessStartInfo BuildStartInfo(string name, string type, int port,
         IReadOnlyDictionary<string, string> properties)
     {
-        var info = new ProcessStartInfo("/usr/bin/avahi-publish-service")
+        var info = new ProcessStartInfo(ShellPath)
         {
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true
         };
+        // The publisher's arguments reach it as "$@": the shell never parses them.
+        info.ArgumentList.Add("-c");
+        info.ArgumentList.Add(CloseDescriptorsAndRunPublisher);
+        info.ArgumentList.Add("avahi-publish-service");
         // Wait for Avahi at boot and reconnect after daemon restarts.
         info.ArgumentList.Add("--no-fail");
         info.ArgumentList.Add("--");
@@ -160,6 +176,10 @@ internal sealed class AvahiServicePublisher
         process.Exited += (_, _) => OnExited(process, myGeneration);
         try
         {
+            // The shell starts without the publisher and would only fail at its exec.
+            if (!File.Exists(PublisherPath))
+                throw new FileNotFoundException($"{PublisherPath} is missing", PublisherPath);
+
             process.Start();
         }
         catch

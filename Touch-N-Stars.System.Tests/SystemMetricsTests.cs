@@ -47,8 +47,11 @@ public class SystemMetricsTests
         var info = AvahiServicePublisher.BuildStartInfo("--rig's name $(false)", "_touchnstars._tcp.", 5050,
             new Dictionary<string, string> { ["instanceName"] = "My rig", ["port"] = "5050" });
         Assert.False(info.UseShellExecute);
-        Assert.Equal("/usr/bin/avahi-publish-service", info.FileName);
-        Assert.Equal(new[] { "--no-fail", "--", "--rig's name $(false)", "_touchnstars._tcp", "5050",
+        // started through a shell that closes NINA's inherited descriptors first; the arguments reach the publisher as "$@"
+        Assert.Equal("/bin/bash", info.FileName);
+        Assert.EndsWith("exec /usr/bin/avahi-publish-service \"$@\"", AvahiServicePublisher.CloseDescriptorsAndRunPublisher);
+        Assert.Equal(new[] { "-c", AvahiServicePublisher.CloseDescriptorsAndRunPublisher, "avahi-publish-service",
+            "--no-fail", "--", "--rig's name $(false)", "_touchnstars._tcp", "5050",
             "txtvers=1", "instanceName=My rig", "port=5050" }, info.ArgumentList);
     }
 }
